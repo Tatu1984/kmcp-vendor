@@ -12,6 +12,8 @@ export const theme = {
     text: "#F5F7FA",
     textMuted: "#94A3B8",
     primary: "#2563EB",
+    /** The peak bar on the Today chart, and nothing else. */
+    primaryBright: "#60A5FA",
     primaryText: "#FFFFFF",
     success: "#16A34A",
     warning: "#D97706",

@@ -9,7 +9,7 @@ import { Loading } from "../../components/ui";
  * Three tabs and no more.
  *
  * Everything an attendant does repeatedly is on the first one; the other two
- * exist because looking a vehicle up and closing a shift are the only other
+ * exist because looking a vehicle up and running a shift are the only other
  * things they do. A fourth tab would be a feature nobody asked for competing
  * for a thumb that is holding a phone in the rain.
  */
@@ -53,10 +53,10 @@ export default function TabsLayout() {
         }}
       />
       <Tabs.Screen
-        name="shift"
+        name="today"
         options={{
-          title: "Shift",
-          tabBarIcon: ({ color }) => <TabGlyph glyph="₹" color={color} />,
+          title: "Today",
+          tabBarIcon: ({ color }) => <TabGlyph glyph="▤" color={color} />,
         }}
       />
     </Tabs>
