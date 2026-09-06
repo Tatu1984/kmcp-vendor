@@ -39,6 +39,37 @@ import type {
  * The ones that change something go through the queue; the ones that only read
  * go straight out, because stale reads are cheap and a queued read is useless.
  */
+/**
+ * The largest page the API will answer.
+ *
+ * `PaginationSchema` caps `pageSize` at 100 and returns 400 above it — not a
+ * clamped list, a refusal. Three call sites here asked for 200 and 500 and got
+ * a validation error every time, which is why the offline zone cache was
+ * quietly never priming.
+ */
+const MAX_PAGE_SIZE = 100;
+
+/**
+ * Walks a paginated endpoint to the end.
+ *
+ * The client returns `data` and drops `meta`, so there is no `total` to stop
+ * on; a short page is the signal that there are no more. `limit` is a guard
+ * against a runaway loop rather than a real expectation — nothing here should
+ * approach it.
+ */
+async function fetchAll<T>(
+  fetchPage: (page: number, pageSize: number) => Promise<T[]>,
+  limit = 1000,
+): Promise<T[]> {
+  const rows: T[] = [];
+  for (let page = 1; rows.length < limit; page++) {
+    const batch = await fetchPage(page, MAX_PAGE_SIZE);
+    rows.push(...batch);
+    if (batch.length < MAX_PAGE_SIZE) break;
+  }
+  return rows.length > limit ? rows.slice(0, limit) : rows;
+}
+
 export function createApi(client: ApiClient, queue: OfflineQueue) {
   return {
     auth: {
@@ -134,8 +165,18 @@ export function createApi(client: ApiClient, queue: OfflineQueue) {
        */
       byId: (zoneId: string) => client.get<CachedZone>(`/zones/${encodeURIComponent(zoneId)}`),
 
-      /** Every zone this attendant may work, with boundaries, for the cache. */
-      assigned: () => client.get<CachedZone[]>("/zones", { query: { pageSize: 200 } }),
+      /**
+       * Every zone this attendant may work, with boundaries, for the cache.
+       *
+       * Paged. This asked for 200 in one request and the API refused it with a
+       * 400 every time, so the offline cache was never actually primed — the
+       * failure was invisible because `primeCache` treats a failed fetch as
+       * "nothing to cache" rather than an error worth showing.
+       */
+      assigned: () =>
+        fetchAll<CachedZone>((page, pageSize) =>
+          client.get<CachedZone[]>("/zones", { query: { page, pageSize } }),
+        ),
     },
 
     tariffs: {
@@ -163,9 +204,11 @@ export function createApi(client: ApiClient, queue: OfflineQueue) {
       today: (attendantId: string) => {
         const midnight = new Date();
         midnight.setHours(0, 0, 0, 0);
-        return client.get<Session[]>("/sessions", {
-          query: { attendantId, from: midnight.toISOString(), pageSize: 200 },
-        });
+        return fetchAll<Session>((page, pageSize) =>
+          client.get<Session[]>("/sessions", {
+            query: { attendantId, from: midnight.toISOString(), page, pageSize },
+          }),
+        );
       },
 
       mine: (attendantId: string) =>
@@ -380,12 +423,16 @@ export function createApi(client: ApiClient, queue: OfflineQueue) {
        * Sorted by code because the code is the only spatial information a
        * `Slot` carries — there is no floor, no level and no coordinates on the
        * model — so A01 next to A02 is the closest thing to a plan of the car
-       * park that exists. A page size of 500 covers any real car park in one
-       * request; paging a grid a citizen scrolls in one gesture would be worse
-       * than fetching it whole.
+       * park that exists.
+       *
+       * Paged rather than fetched whole: 500 was refused outright by the API,
+       * which caps a page at 100. A large car park therefore costs a few
+       * requests, and the grid still arrives complete.
        */
       list: (zoneId: string) =>
-        client.get<Slot[]>("/slots", { query: { zoneId, pageSize: 500, sort: "code" } }),
+        fetchAll<Slot>((page, pageSize) =>
+          client.get<Slot[]>("/slots", { query: { zoneId, page, pageSize, sort: "code" } }),
+        ),
     },
 
     shifts: {
