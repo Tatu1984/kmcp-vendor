@@ -1,8 +1,9 @@
 name: CI
 
-# The shared package is the reason this repo exists, and it is also the thing
-# that breaks both apps at once when it changes. Typechecking every workspace on
-# every push is what catches that before a handset does.
+# packages/api is shared with the citizen app in its own repository, so a change
+# here can break something that is not in this checkout. Typechecking every
+# workspace catches what it can — the rest is the copy discipline the README
+# describes.
 
 on:
   push:

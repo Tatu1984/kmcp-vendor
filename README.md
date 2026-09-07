@@ -1,17 +1,14 @@
-# KMCP mobile
+# KMCP attendant app
 
-Two applications, one repository:
+What a parking attendant uses at the kerb. Starts and ends parking sessions,
+photographs the plate, takes cash, and runs a shift.
 
-- **`apps/vendor`** — what a parking attendant uses at the kerb. Starts and ends
-  parking sessions, photographs the plate, takes cash, and runs a shift.
-- **`apps/citizen`** — the public app. Find a government car park, see what is
-  free bay by bay, find the car an attendant has started a session for, and pay
-  for it.
-
-They share **`packages/api`**: the API client, the types the server actually
-returns, and the offline queue. That package is the reason this is one
-repository rather than two — the alternative is maintaining the same client
-twice and letting the copies drift.
+> **On the name.** The repository is `kmcp-vendor` and the workspace is
+> `@kmcp/vendor`, but the person holding this handset is an **attendant** — the
+> kerbside staff a vendor employs. KMC contracts the vendor; the vendor employs
+> the attendant; the vendor's own dashboard is a web screen in the KMCP portal
+> at `/vendor`, not this app. The naming is inherited and worth knowing before
+> somebody files a vendor-company feature request against this repo.
 
 ## The rule that shapes everything here
 
@@ -25,33 +22,53 @@ without an app release, and what stops a modified build from parking for free.
 
 ```
 npm install
-npm run vendor      # Expo dev server for the attendant app
-npm run citizen     # Expo dev server for the citizen app
+npm start           # Expo dev server
 npm run typecheck
 ```
 
-The apps read `EXPO_PUBLIC_API_URL`. Without it they run against nothing and say
-so, rather than appearing to work.
+The app reads `EXPO_PUBLIC_API_URL`. Without it, it runs against nothing and
+says so, rather than appearing to work. See `apps/vendor/.env.example`.
 
-The citizen app also reads `EXPO_PUBLIC_GOOGLE_MAPS_KEY`, and only on Android:
-Google Maps draws a blank grey rectangle without one rather than failing, so the
-map screen checks for a key up front and falls back to a plain list that says
-why. iOS uses Apple Maps and needs nothing. The key is never committed — see
-`apps/citizen/.env.example`.
+## Layout
 
-## What the citizen app is still waiting for
+```
+apps/vendor      the app itself
+packages/api     the API client, the types the server actually returns,
+                 and the offline queue
+```
 
-Most of the citizen screens are built against endpoints the server does not
-offer yet, and they say so on themselves rather than showing a zero. Two
-different holes exist and they are not the same problem:
+A workspace with one app in it looks like overkill until you notice the second
+directory. `packages/api` is shared with the citizen app, which lives in its own
+repository — see below.
 
-- **Not built.** `/me/sessions`, `/me/payments`, `/me/vehicles`, `/me/favourites`
-  and the whole wallet. The tables behind all of them already exist.
-- **Not permitted.** `slots/summary/:zoneId`, `slots`, `zones/:id`,
-  `tariffs/applicable`, `sessions/plate/:plateNumber` and `payments/collect` all
-  work — but the `CITIZEN` role holds no permissions at all, so every one of them
-  answers 403. `zones/nearby` is the single public route on the API, which is why
-  the map works and nothing else does.
+## The shared client, and the drift it invites
 
-`packages/api/src/gaps.ts` is the list, in code, with the reason for each. When
-one of them ships, its entry goes and the screen quoting it starts working.
+`packages/api` was the reason the two apps were one repository. Splitting them
+does not remove that dependency; it moves it from a problem the tooling solved
+into one people have to.
+
+**The copies must stay identical.** Nothing here should be edited to suit this
+app alone: an endpoint the citizen app needs, a type the server returns, a
+change to the offline queue — all of it belongs to both. Two divergent copies of
+an API client is exactly the failure the monorepo existed to prevent, and it
+arrives quietly, one small local fix at a time.
+
+Three ways to hold the line, in increasing order of effort and safety:
+
+1. **Copy deliberately.** When `packages/api` changes in either repository, copy
+   the whole directory across and commit it with the same message. Cheap, works
+   today, relies on discipline.
+2. **`git subtree`.** Keep `packages/api` in a third repository and pull it into
+   both. Real history, no publishing step, a command to remember.
+3. **Publish it.** `@kmcp/api` to a private registry, versioned. The right answer
+   once either app is in the stores and a bad client cannot simply be
+   re-deployed.
+
+Until one of those is chosen, treat any diff in `packages/api` between this
+repository and the citizen one as a bug.
+
+## Where it points
+
+`EXPO_PUBLIC_API_URL` is the deployed API — `https://kmcp-backend.vercel.app/api/v1`
+for the demonstration environment. The app holds no camera credentials, no
+tariff table and no fare arithmetic of its own; it asks.

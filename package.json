@@ -1,18 +1,19 @@
 {
-  "name": "kmcp-mobile",
+  "name": "kmcp-vendor",
   "private": true,
   "version": "1.0.0",
-  "description": "KMCP field applications — the Vendor app used by attendants at the kerb, and the Citizen app used by drivers.",
+  "description": "KMCP attendant app \u2014 what kerbside staff use to start sessions, take cash and run a shift. Shares packages/api with the citizen app, which lives in its own repository.",
   "workspaces": [
     "packages/*",
     "apps/*"
   ],
   "scripts": {
+    "start": "npm run start --workspace @kmcp/vendor",
+    "android": "npm run android --workspace @kmcp/vendor",
+    "ios": "npm run ios --workspace @kmcp/vendor",
     "typecheck": "npm run typecheck --workspaces --if-present",
     "lint": "npm run lint --workspaces --if-present",
-    "test": "npm run test --workspaces --if-present",
-    "vendor": "npm run start --workspace @kmcp/vendor",
-    "citizen": "npm run start --workspace @kmcp/citizen"
+    "test": "npm run test --workspaces --if-present"
   },
   "engines": {
     "node": ">=22"
