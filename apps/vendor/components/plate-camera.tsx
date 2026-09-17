@@ -66,12 +66,16 @@ export function PlateCamera({
         </Screen>
       ) : (
         <View style={styles.fill}>
-          <CameraView ref={cameraRef} style={styles.fill} facing="back">
-            <View style={styles.overlay}>
+          {/* The reticle sits beside the camera, not inside it: `CameraView`
+              renders no children (expo-camera 57 warns and may crash), so the
+              overlay is a sibling laid over the same box. */}
+          <View style={styles.preview}>
+            <CameraView ref={cameraRef} style={StyleSheet.absoluteFill} facing="back" />
+            <View style={styles.overlay} pointerEvents="none">
               <Text style={styles.hint}>Frame the number plate</Text>
               <View style={styles.reticle} />
             </View>
-          </CameraView>
+          </View>
 
           <View style={styles.controls}>
             <Pressable
@@ -103,7 +107,13 @@ export function PlateCamera({
 
 const styles = StyleSheet.create({
   fill: { flex: 1, backgroundColor: "#000" },
-  overlay: { flex: 1, alignItems: "center", justifyContent: "center", gap: theme.space(2) },
+  preview: { flex: 1, backgroundColor: "#000" },
+  overlay: {
+    ...StyleSheet.absoluteFill,
+    alignItems: "center",
+    justifyContent: "center",
+    gap: theme.space(2),
+  },
   hint: {
     ...theme.text.body,
     color: "#FFF",
