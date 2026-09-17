@@ -55,7 +55,14 @@ export default function Kerb() {
     setRefreshing(false);
   }
 
-  const overstaying = (sessions ?? []).filter((s) => s.isOverstay).length;
+  /**
+   * Late by either measure. The server sets `isOverstay` from elapsed time on
+   * every list row and separately promotes `status` to OVERSTAY on a schedule;
+   * the two agree except in the minutes between the threshold passing and the
+   * scheduler running, and either one is reason enough to flag the vehicle.
+   */
+  const late = (s: Session) => Boolean(s.isOverstay) || s.status === "OVERSTAY";
+  const overstaying = (sessions ?? []).filter(late).length;
 
   return (
     <ScrollView
@@ -112,7 +119,7 @@ export default function Kerb() {
           <Card key={session.id} onPress={() => router.push(`/session/${session.code}`)}>
             <View style={styles.cardTop}>
               <Plate value={formatPlate(session.plateNumber)} size="small" />
-              {session.isOverstay ? (
+              {late(session) ? (
                 <Pill tone="warning" label="Overstay" />
               ) : (
                 <Pill tone="info" label="Running" />

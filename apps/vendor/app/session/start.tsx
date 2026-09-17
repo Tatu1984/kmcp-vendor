@@ -48,7 +48,13 @@ export default function StartSession() {
 
   const [zone, setZone] = React.useState<CachedZone | null>(null);
   const [zoneOffline, setZoneOffline] = React.useState(false);
-  const [zoneError, setZoneError] = React.useState<string | null>(null);
+  /**
+   * Why there is no zone on screen. Two different failures wear it: standing
+   * outside every zone, and the server refusing to say — a 403, a closed
+   * route, a validation error. They get different titles because the first is
+   * fixed by walking and the second is not.
+   */
+  const [zoneError, setZoneError] = React.useState<{ title: string; body: string } | null>(null);
   const [plate, setPlate] = React.useState("");
   const [vehicleType, setVehicleType] = React.useState<SlotType>("CAR");
   const [capture, setCapture] = React.useState<Capture | null>(null);
@@ -63,27 +69,41 @@ export default function StartSession() {
     let cancelled = false;
 
     void (async () => {
-      // Asks the server, and falls back to the same geometry against cached
-      // boundaries when it cannot be reached. Either way the server re-checks
-      // this when the session syncs.
-      const resolved = await resolveZone(api, cache, location.fix.lat, location.fix.lng);
-      if (cancelled) return;
+      try {
+        // Asks the server, and falls back to the same geometry against cached
+        // boundaries only when it cannot be reached. Either way the server
+        // re-checks this when the session syncs.
+        const resolved = await resolveZone(api, cache, location.fix.lat, location.fix.lng);
+        if (cancelled) return;
 
-      if (!resolved) {
-        setZoneError(
-          "You are not inside any zone you are assigned to. Move to the kerb you are working.",
-        );
-        return;
+        if (!resolved) {
+          setZoneError({
+            title: "Not in a parking zone",
+            body: "You are not inside any zone you are assigned to. Move to the kerb you are working.",
+          });
+          return;
+        }
+
+        setZone(resolved.zone);
+        setZoneOffline(resolved.offline);
+        setZoneError(null);
+
+        const allowed = resolved.zone.allowedVehicleTypeIds ?? [];
+        // Default to the commonest permitted type rather than to CAR, which a
+        // two-wheeler-only lane would refuse.
+        if (allowed.length > 0 && !allowed.includes("CAR")) setVehicleType(allowed[0]);
+      } catch (cause) {
+        if (cancelled) return;
+        // The server answered and said no. Its words are the honest ones —
+        // "outside every zone assigned to you", "not permitted" — and none of
+        // them is "no signal", so the cache is not consulted.
+        setZone(null);
+        setZoneOffline(false);
+        setZoneError({
+          title: "The server could not place you",
+          body: cause instanceof ApiError ? cause.message : "Could not work out which zone you are in.",
+        });
       }
-
-      setZone(resolved.zone);
-      setZoneOffline(resolved.offline);
-      setZoneError(null);
-
-      const allowed = resolved.zone.allowedVehicleTypeIds ?? [];
-      // Default to the commonest permitted type rather than to CAR, which a
-      // two-wheeler-only lane would refuse.
-      if (allowed.length > 0 && !allowed.includes("CAR")) setVehicleType(allowed[0]);
     })();
 
     return () => {
@@ -168,7 +188,7 @@ export default function StartSession() {
           body="A session can only be started inside the zone it is for, so the handset has to know where it is."
         />
       ) : zoneError ? (
-        <Banner tone="danger" title="Not in a parking zone" body={zoneError} />
+        <Banner tone="danger" title={zoneError.title} body={zoneError.body} />
       ) : zone ? (
         <Card>
           <Text style={styles.zoneLabel}>YOU ARE IN</Text>

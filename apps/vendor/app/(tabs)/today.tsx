@@ -30,12 +30,25 @@ import { theme } from "../../lib/theme";
  * system, which is the whole thing a reconciliation is meant to test.
  */
 export default function TodayScreen() {
-  const { user, shift, refreshShift, refreshCache, signOut, queued, rejected, syncing, sync, online, cacheAgeHours } =
-    useSession();
+  const {
+    user,
+    shift,
+    refreshShift,
+    refreshCache,
+    signOut,
+    queued,
+    rejected,
+    syncing,
+    sync,
+    online,
+    cacheAgeHours,
+    cacheFailures,
+  } = useSession();
   const location = useLocation(false);
 
   const [cash, setCash] = React.useState("");
   const [busy, setBusy] = React.useState(false);
+  const [refreshing, setRefreshing] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
   const [closed, setClosed] = React.useState<{ variance: number; matched: boolean } | null>(null);
 
@@ -175,9 +188,14 @@ export default function TodayScreen() {
   const peak = hours && hours.length > 0 ? Math.max(...hours.map((h) => h.count)) : 0;
 
   async function onRefresh() {
-    await sync();
-    await refreshShift();
-    await load();
+    setRefreshing(true);
+    try {
+      await sync();
+      await refreshShift();
+      await load();
+    } finally {
+      setRefreshing(false);
+    }
   }
 
   return (
@@ -186,7 +204,7 @@ export default function TodayScreen() {
       contentContainerStyle={styles.content}
       keyboardShouldPersistTaps="handled"
       refreshControl={
-        <RefreshControl refreshing={false} onRefresh={() => void onRefresh()} tintColor={theme.colour.text} />
+        <RefreshControl refreshing={refreshing} onRefresh={() => void onRefresh()} tintColor={theme.colour.text} />
       }
     >
       {/* ───────────────────────────────────────────────────────── who */}
@@ -277,6 +295,13 @@ export default function TodayScreen() {
             <Pill tone="default" label="Rates current" />
           )}
         </View>
+        {cacheFailures.length > 0 ? (
+          <Banner
+            tone="warning"
+            title="Offline copy is incomplete"
+            body={describeCacheFailures(cacheFailures)}
+          />
+        ) : null}
         <Button
           label="Refresh offline rates"
           variant="secondary"
@@ -433,6 +458,34 @@ function Tile({
 }
 
 const pad = (n: number) => String(n).padStart(2, "0");
+
+/**
+ * Names what the last priming could not fetch, in the attendant's words.
+ *
+ * `primeCache` reports "zones", "holidays" and "tariff:<zone>:<type>". A
+ * partly primed cache passes for a full one on the "Rates current" pill —
+ * the age is the same either way — so this is the only place the gap shows
+ * before the attendant discovers it at a kerb with no signal.
+ */
+function describeCacheFailures(failed: string[]): string {
+  const parts: string[] = [];
+  if (failed.includes("zones")) parts.push("zone boundaries");
+  if (failed.includes("holidays")) parts.push("the holiday calendar");
+
+  const tariffs = failed.filter((f) => f.startsWith("tariff:"));
+  if (tariffs.length > 0) {
+    const named = tariffs.slice(0, 3).map((f) => {
+      const [, zone, type] = f.split(":");
+      return `${zone ?? "?"} ${(type ?? "").toLowerCase().replace("_", "-")}`.trim();
+    });
+    const more = tariffs.length > named.length ? ` and ${tariffs.length - named.length} more` : "";
+    parts.push(
+      `${tariffs.length} rate card${tariffs.length === 1 ? "" : "s"} (${named.join(", ")}${more})`,
+    );
+  }
+
+  return `Could not fetch ${parts.join("; ")}. Without them, sessions there cannot be priced when there is no signal. Refresh once you have a better connection.`;
+}
 
 const styles = StyleSheet.create({
   flex: { flex: 1, backgroundColor: theme.colour.bg },

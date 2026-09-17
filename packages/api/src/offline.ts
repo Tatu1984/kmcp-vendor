@@ -1,7 +1,9 @@
 import type { Api } from "./endpoints";
 import type { OfflineCache } from "./cache";
+import { ApiError } from "./client";
 import { estimateFare, type ProvisionalQuote } from "./fare";
-import { withinZone } from "./geo";
+import { gapOf } from "./gaps";
+import { distanceMetres, withinZone } from "./geo";
 import type { CachedZone, SlotType } from "./types";
 
 /**
@@ -13,7 +15,15 @@ import type { CachedZone, SlotType } from "./types";
  * actually arrived.
  */
 
-/** Fills the cache with everything needed to work through an outage. */
+/**
+ * Fills the cache with everything needed to work through an outage.
+ *
+ * `failed` names each piece that could not be fetched — "zones", "holidays",
+ * or "tariff:<zone code>:<vehicle type>" — so the caller can say which. A
+ * cache that is three rate cards short looks identical to a full one from the
+ * outside; the attendant finds out at a kerb with no signal, which is the one
+ * place they cannot do anything about it.
+ */
 export async function primeCache(
   api: Api,
   cache: OfflineCache,
@@ -76,10 +86,23 @@ export interface ResolvedZone {
 /**
  * Which zone the handset is standing in, asking the server first.
  *
- * The offline path runs the server's own geometry against cached boundaries. It
- * is no more permissive than the server would be, so a session it allows is one
- * the server will accept when it syncs — the alternative, guessing generously,
- * would queue work destined to be rejected after the cash was taken.
+ * The cache answers only when the server could not be reached — a dead
+ * connection, a timeout, or a server that fell over before answering. A
+ * server that answered and refused is a different thing entirely: a 403 means
+ * this handset may not ask, a 404 means the route is not there, a 422 means
+ * "you are outside every zone", and every one of those is rethrown so the
+ * screen shows the real reason. Dressing a refusal up as "no signal" and
+ * answering from the cache would have the handset overriding a reply that
+ * actually arrived, which is the one thing this module promises never to do.
+ *
+ * The offline path runs the server's own geometry against cached boundaries
+ * and, like the server, takes the nearest centre when more than one zone
+ * matches. It is no more permissive than the server would be, so a session it
+ * allows is one the server will accept when it syncs — the alternative,
+ * guessing generously, would queue work destined to be rejected after the
+ * cash was taken. What it cannot match is the server's zone scope: the cache
+ * holds the zones this attendant was assigned when it was primed, and an
+ * assignment that changed since is only known once there is signal again.
  */
 export async function resolveZone(
   api: Api,
@@ -94,22 +117,27 @@ export async function resolveZone(
       offline: false,
       alternatives: live.alternatives ?? [],
     };
-  } catch {
-    // Fall through — a refusal and an unreachable server look the same from
-    // here, and the cache can answer both safely.
+  } catch (error) {
+    if (gapOf(error) !== null) throw error;
+    const unreachable = !(error instanceof ApiError) || error.isRetryable;
+    if (!unreachable) throw error;
+    // Fall through: the server was never reached, so the cache is the best
+    // answer there is.
   }
 
+  const point = { lat, lng };
   const { zones, geofenceToleranceM } = await cache.load();
   const matches = zones
     .filter((z) => z.status === "OPEN")
     .filter((z) =>
-      withinZone(
-        { lat, lng },
-        z.boundary,
-        { lat: z.centerLat, lng: z.centerLng },
-        geofenceToleranceM,
-      ),
-    );
+      withinZone(point, z.boundary, { lat: z.centerLat, lng: z.centerLng }, geofenceToleranceM),
+    )
+    .map((zone) => ({
+      zone,
+      distance: distanceMetres(point, { lat: zone.centerLat, lng: zone.centerLng }),
+    }))
+    .sort((a, b) => a.distance - b.distance)
+    .map((m) => m.zone);
 
   const nearest = matches[0];
   if (!nearest) return null;
