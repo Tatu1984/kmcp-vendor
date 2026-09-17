@@ -2,7 +2,7 @@ import * as React from "react";
 import { AppState } from "react-native";
 import NetInfo from "@react-native-community/netinfo";
 import { primeCache } from "@kmcp/api";
-import type { Principal, Shift } from "@kmcp/api";
+import type { LoginResponse, Principal, Shift } from "@kmcp/api";
 
 import {
   api,
@@ -25,6 +25,19 @@ import {
  * once here rather than fetched per screen.
  */
 
+/**
+ * How a sign-in attempt ended when the server did not refuse it.
+ *
+ * Two outcomes rather than one because the server has two: an account with an
+ * authenticator enrolled is answered with a challenge and no tokens, and the
+ * screen has to ask for the code before anybody is signed in. A refusal —
+ * wrong password, unbound handset — is thrown, not returned, so the ordinary
+ * error path stays the ordinary error path.
+ */
+export type SignInResult =
+  | { status: "ok" }
+  | { status: "two_factor_required"; challengeId: string };
+
 interface SessionState {
   ready: boolean;
   configured: boolean;
@@ -37,7 +50,16 @@ interface SessionState {
   online: boolean;
   /** How stale the cached zones and rate cards are, in hours. */
   cacheAgeHours: number | null;
-  signIn: (phone: string, password: string) => Promise<void>;
+  /**
+   * What the last cache priming could not fetch, as `primeCache` names it.
+   *
+   * Empty after a complete priming. Kept here because a partly primed cache
+   * is indistinguishable from a full one by age alone, and the attendant
+   * needs to know before the signal goes, not after.
+   */
+  cacheFailures: string[];
+  signIn: (phone: string, password: string) => Promise<SignInResult>;
+  verifyTwoFactor: (challengeId: string, code: string) => Promise<void>;
   signOut: () => Promise<void>;
   refreshShift: () => Promise<void>;
   sync: () => Promise<void>;
@@ -52,6 +74,7 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
   const [shift, setShift] = React.useState<Shift | null>(null);
   const [online, setOnline] = React.useState(true);
   const [cacheAgeHours, setCacheAgeHours] = React.useState<number | null>(null);
+  const [cacheFailures, setCacheFailures] = React.useState<string[]>([]);
   const [queueState, setQueueState] = React.useState({ pending: 0, rejected: 0, syncing: false });
 
   const refreshShift = React.useCallback(async () => {
@@ -65,10 +88,13 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
 
   const refreshCache = React.useCallback(async () => {
     try {
-      await primeCache(api, cache);
+      const primed = await primeCache(api, cache);
+      setCacheFailures(primed.failed);
     } catch {
       // Priming is best-effort. Failing it leaves the previous copy in place,
-      // which is exactly what it is for.
+      // which is exactly what it is for — but say so, rather than let the
+      // previous copy pass for a fresh one.
+      setCacheFailures(["zones", "holidays"]);
     }
     setCacheAgeHours(cache.ageHours());
   }, []);
@@ -145,13 +171,48 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
     };
   }, [user]);
 
-  const signIn = React.useCallback(
-    async (phone: string, password: string) => {
-      const result = await api.auth.loginWithPhone(phone, password, getDeviceId());
-      if (result.tokens) await saveTokens(result.tokens);
+  /**
+   * Turns a login response into a signed-in handset.
+   *
+   * Shared by the password step and the authenticator step because the server
+   * answers both with the same shape. A response that claims to have signed
+   * us in but carries no tokens is treated as a failure rather than let
+   * through: `loadUser` would then call `/auth/me` unauthenticated and the
+   * attendant would see a 401 that nothing on screen explains.
+   */
+  const settle = React.useCallback(
+    async (result: LoginResponse): Promise<SignInResult> => {
+      if (result.status === "two_factor_required") {
+        if (!result.challengeId) {
+          throw new Error("The server asked for an authenticator code but sent no challenge.");
+        }
+        return { status: "two_factor_required", challengeId: result.challengeId };
+      }
+      if (!result.tokens) throw new Error("The server accepted the sign-in but sent no session.");
+      await saveTokens(result.tokens);
       await loadUser();
+      return { status: "ok" };
     },
     [loadUser],
+  );
+
+  const signIn = React.useCallback(
+    (phone: string, password: string) =>
+      api.auth.loginWithPhone(phone, password, getDeviceId()).then(settle),
+    [settle],
+  );
+
+  const verifyTwoFactor = React.useCallback(
+    async (challengeId: string, code: string) => {
+      const result = await settle(await api.auth.verifyTwoFactor(challengeId, code));
+      // The verify route never answers with another challenge; if it ever
+      // did, looping the attendant back to the code field would be wrong and
+      // saying so is better than pretending they are signed in.
+      if (result.status !== "ok") {
+        throw new Error("The server asked for a second code. Try signing in again.");
+      }
+    },
+    [settle],
   );
 
   const signOut = React.useCallback(async () => {
@@ -174,7 +235,9 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
     syncing: queueState.syncing,
     online,
     cacheAgeHours,
+    cacheFailures,
     signIn,
+    verifyTwoFactor,
     signOut,
     refreshShift,
     refreshCache,

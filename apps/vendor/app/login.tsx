@@ -15,33 +15,62 @@ import { theme } from "../lib/theme";
  * at all. The account is bound to this handset, so the first sign-in on a new
  * device is refused until an administrator releases the binding — which is what
  * stops one login being passed around a depot.
+ *
+ * Two steps on one screen when the account has an authenticator enrolled. The
+ * password form gives way to a single six-digit field rather than a second
+ * screen, because the number and password are still the context for the code
+ * and a stack push would lose them on the way back.
  */
 export default function Login() {
-  const { user, signIn } = useSession();
+  const { user, signIn, verifyTwoFactor } = useSession();
   const [phone, setPhone] = React.useState("");
   const [password, setPassword] = React.useState("");
+  const [code, setCode] = React.useState("");
+  /** Set once the password was accepted and the server wants a code too. */
+  const [challengeId, setChallengeId] = React.useState<string | null>(null);
   const [error, setError] = React.useState<string | null>(null);
   const [busy, setBusy] = React.useState(false);
 
   if (user) return <Redirect href="/(tabs)" />;
 
   const canSubmit = phone.trim().length >= 10 && password.length >= 6 && !busy;
+  const canVerify = /^\d{6}$/.test(code) && !busy;
 
   async function submit() {
     setBusy(true);
     setError(null);
     try {
-      await signIn(phone.trim(), password);
+      const result = await signIn(phone.trim(), password);
+      if (result.status === "two_factor_required") {
+        setChallengeId(result.challengeId);
+        setCode("");
+        setBusy(false);
+      }
+      // On "ok" the provider sets `user` and the redirect above takes over;
+      // leaving `busy` set stops the button flashing enabled in between.
     } catch (cause) {
-      setError(
-        cause instanceof ApiError
-          ? cause.isAuthError
-            ? "That mobile number and password did not match."
-            : cause.message
-          : "Could not reach the server. Check your connection and try again.",
-      );
+      setError(describe(cause, "password"));
       setBusy(false);
     }
+  }
+
+  async function verify() {
+    if (!challengeId) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await verifyTwoFactor(challengeId, code);
+    } catch (cause) {
+      setError(describe(cause, "code"));
+      setBusy(false);
+    }
+  }
+
+  function startOver() {
+    setChallengeId(null);
+    setCode("");
+    setPassword("");
+    setError(null);
   }
 
   return (
@@ -60,32 +89,70 @@ export default function Login() {
 
         {error ? <Banner tone="danger" title={error} /> : null}
 
-        <Field
-          label="Mobile number"
-          value={phone}
-          onChangeText={setPhone}
-          keyboardType="phone-pad"
-          autoComplete="tel"
-          textContentType="telephoneNumber"
-          placeholder="98XXXXXXXX"
-          maxLength={10}
-          editable={!busy}
-        />
+        {challengeId === null ? (
+          <>
+            <Field
+              label="Mobile number"
+              value={phone}
+              onChangeText={setPhone}
+              keyboardType="phone-pad"
+              autoComplete="tel"
+              textContentType="telephoneNumber"
+              placeholder="98XXXXXXXX"
+              maxLength={10}
+              editable={!busy}
+            />
 
-        <Field
-          label="Password"
-          value={password}
-          onChangeText={setPassword}
-          secureTextEntry
-          autoComplete="current-password"
-          textContentType="password"
-          placeholder="••••••••"
-          editable={!busy}
-          onSubmitEditing={() => canSubmit && void submit()}
-          returnKeyType="go"
-        />
+            <Field
+              label="Password"
+              value={password}
+              onChangeText={setPassword}
+              secureTextEntry
+              autoComplete="current-password"
+              textContentType="password"
+              placeholder="••••••••"
+              editable={!busy}
+              onSubmitEditing={() => canSubmit && void submit()}
+              returnKeyType="go"
+            />
 
-        <Button label="Sign in" onPress={() => void submit()} disabled={!canSubmit} busy={busy} />
+            <Button label="Sign in" onPress={() => void submit()} disabled={!canSubmit} busy={busy} />
+          </>
+        ) : (
+          <>
+            <Field
+              label="Authenticator code"
+              value={code}
+              onChangeText={(next) => setCode(next.replace(/\D/g, "").slice(0, 6))}
+              keyboardType="number-pad"
+              autoComplete="one-time-code"
+              textContentType="oneTimeCode"
+              placeholder="000000"
+              maxLength={6}
+              editable={!busy}
+              autoFocus
+              style={styles.codeInput}
+              onSubmitEditing={() => canVerify && void verify()}
+              returnKeyType="go"
+              hint={`Password accepted for ${phone.trim()}. Enter the six digits from your authenticator app.`}
+            />
+
+            <Button
+              label="Verify and sign in"
+              onPress={() => void verify()}
+              disabled={!canVerify}
+              busy={busy}
+            />
+
+            <Button
+              label="Different number"
+              variant="secondary"
+              size="medium"
+              onPress={startOver}
+              disabled={busy}
+            />
+          </>
+        )}
 
         <View style={styles.footer}>
           <Text style={styles.footnote}>
@@ -101,6 +168,32 @@ export default function Login() {
   );
 }
 
+/**
+ * The one line to show for a failed attempt.
+ *
+ * Branches on `code`, never on `message`, because the server may reword a
+ * message at any time. `DEVICE_NOT_BOUND` gets its own words: the password was
+ * right and the account is fine, it is this phone that is not the one on
+ * record, and the only fix is a supervisor — none of which "those details are
+ * not correct" would tell anybody.
+ */
+function describe(cause: unknown, step: "password" | "code"): string {
+  if (!(cause instanceof ApiError)) {
+    return cause instanceof Error && cause.message
+      ? cause.message
+      : "Could not reach the server. Check your connection and try again.";
+  }
+  if (cause.code === "DEVICE_NOT_BOUND") {
+    return "This account is bound to another phone. Ask your supervisor to release it before signing in here.";
+  }
+  if (cause.isAuthError) {
+    return step === "password"
+      ? "That mobile number and password did not match."
+      : "That code did not match. Check your authenticator app and try again.";
+  }
+  return cause.message;
+}
+
 const styles = StyleSheet.create({
   flex: { flex: 1, backgroundColor: theme.colour.bg },
   header: { gap: theme.space(0.5), paddingVertical: theme.space(4) },
@@ -112,6 +205,7 @@ const styles = StyleSheet.create({
   },
   title: { ...theme.text.display, color: theme.colour.text },
   subtitle: { ...theme.text.body, color: theme.colour.textMuted },
+  codeInput: { fontSize: 30, fontWeight: "700", letterSpacing: 10, textAlign: "center" },
   footer: { marginTop: "auto", gap: theme.space(1), paddingTop: theme.space(3) },
   footnote: { ...theme.text.small, color: theme.colour.textMuted },
 });

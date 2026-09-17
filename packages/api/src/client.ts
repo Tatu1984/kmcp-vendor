@@ -164,13 +164,28 @@ export class ApiClient {
     const payload = (await response.json().catch(() => null)) as ApiEnvelope<T> | null;
 
     if (!response.ok || !payload?.success) {
-      throw new ApiError(
+      const error = new ApiError(
         payload?.error?.code ?? "INTERNAL_ERROR",
         payload?.error?.message ?? "Something went wrong. Please try again.",
         response.status,
         payload?.error?.details,
         payload?.meta?.requestId,
       );
+
+      // A handset a supervisor has released is signed out, not merely refused.
+      // `/auth/me` skips the device check, so the tokens still "work" for the
+      // one call the app makes at startup and fail for every call after it —
+      // which leaves an attendant looking signed in on a phone that can do
+      // nothing. Treating this like a revoked session sends them to the login
+      // screen, where the reason is explained. Anonymous requests are exempt:
+      // a login refused for this reason has no session to end, and the login
+      // screen shows that refusal itself.
+      if (error.code === "DEVICE_NOT_BOUND" && !anonymous) {
+        this.config.setTokens(null);
+        this.config.onSignedOut?.();
+      }
+
+      throw error;
     }
 
     return payload.data;
