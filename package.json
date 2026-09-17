@@ -11,6 +11,7 @@
     "start": "npm run start --workspace @kmcp/vendor",
     "android": "npm run android --workspace @kmcp/vendor",
     "ios": "npm run ios --workspace @kmcp/vendor",
+    "dev:local": "npm run dev:local --workspace @kmcp/vendor",
     "typecheck": "npm run typecheck --workspaces --if-present",
     "lint": "npm run lint --workspaces --if-present",
     "test": "npm run test --workspaces --if-present"

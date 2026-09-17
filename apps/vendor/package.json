@@ -7,27 +7,37 @@
     "start": "expo start",
     "android": "expo start --android",
     "ios": "expo start --ios",
+    "dev:local": "node scripts/start-local.js",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@kmcp/api": "*",
     "@react-native-async-storage/async-storage": "^2.2.0",
-    "@react-native-community/netinfo": "^11.5.2",
-    "expo": "^54.0.0",
-    "expo-application": "~7.0.0",
-    "expo-camera": "~17.0.0",
-    "expo-constants": "~18.0.0",
-    "expo-location": "~19.0.0",
-    "expo-router": "~6.0.0",
-    "expo-secure-store": "~15.0.0",
-    "expo-status-bar": "~3.0.0",
-    "react": "19.1.0",
-    "react-native": "0.81.5",
-    "react-native-safe-area-context": "~5.6.0",
-    "react-native-screens": "~4.16.0"
+    "@react-native-community/netinfo": "12.0.1",
+    "expo": "^57.0.0",
+    "expo-application": "~57.0.3",
+    "expo-camera": "~57.0.5",
+    "expo-constants": "~57.0.18",
+    "expo-linking": "~57.0.10",
+    "expo-location": "~57.0.18",
+    "expo-router": "~57.0.21",
+    "expo-secure-store": "~57.0.4",
+    "expo-status-bar": "~57.0.1",
+    "react": "19.3.0",
+    "react-native": "0.86.3",
+    "react-native-safe-area-context": "~5.7.0",
+    "react-native-screens": "~4.26.0",
+    "react-native-webview": "13.16.1"
   },
   "devDependencies": {
-    "@types/react": "~19.1.0",
-    "typescript": "^5.9.3"
+    "@types/react": "~19.2.4",
+    "typescript": "~6.0.3"
+  },
+  "expo": {
+    "install": {
+      "exclude": [
+        "react"
+      ]
+    }
   }
 }

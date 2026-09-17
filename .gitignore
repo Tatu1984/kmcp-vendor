@@ -5,6 +5,7 @@ web-build/
 *.log
 .env*
 !.env.example
+!.env.local.example
 .DS_Store
 ios/
 android/
