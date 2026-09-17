@@ -2,8 +2,8 @@
  * The shapes the API actually returns.
  *
  * Hand-written rather than generated, and deliberately narrow: these describe
- * what the field apps read, not everything the server can say. Anything absent
- * here is absent because no screen needs it yet.
+ * what the attendant app reads, not everything the server can say. Anything
+ * absent here is absent because no screen needs it yet.
  *
  * Every amount is integer paise. There is no floating point in the money path
  * anywhere in this platform, and adding one here would be the place it starts.
@@ -129,8 +129,17 @@ export interface Quote {
   waivedByPass: boolean;
 }
 
+/**
+ * What `POST /sessions/:id/end` returns.
+ *
+ * `quote` is optional because the idempotent-replay branch on the server
+ * returns the session as it was already stored, with no breakdown — an offline
+ * end replayed after the first attempt did go through comes back this way.
+ * The fare itself is still on `payableAmount`; only the line-by-line
+ * explanation is missing.
+ */
 export interface EndedSession extends Session {
-  quote: Quote;
+  quote?: Quote;
 }
 
 export interface PlateLookup {
@@ -169,6 +178,19 @@ export interface Payment {
   gatewayOrder?: { id: string; amount: number; currency: string };
 }
 
+/**
+ * What the checkout sheet hands back, sent verbatim to `POST /payments/:id/verify`.
+ *
+ * Three opaque strings from Razorpay. The server recomputes the signature
+ * with a secret this handset never holds and refuses the capture if it does
+ * not match, so nothing here is trusted on its own.
+ */
+export interface VerifyPayment {
+  razorpayOrderId: string;
+  razorpayPaymentId: string;
+  razorpaySignature: string;
+}
+
 export interface Shift {
   id: string;
   attendantId: string;
@@ -183,11 +205,13 @@ export interface Shift {
   status: "OPEN" | "CLOSED" | "VERIFIED" | "VARIANCE_FLAGGED";
   zone?: { id: string; code: string; name: string } | null;
   /**
-   * The attendant's own vendor. `commissionPct` is optional because the server
-   * does not send it yet — the Today screen hides the share tile rather than
-   * inventing a percentage. See notes in today.tsx.
+   * The attendant's own vendor, sent with the shift so the handset can show
+   * the vendor's share without calling `/revenue`.
+   *
+   * `commissionPct` is a Prisma `Decimal`, which serialises as a string — not a
+   * number. Anything doing arithmetic with it coerces first; `today.tsx` does.
    */
-  vendor?: { id: string; orgName: string; commissionPct?: number } | null;
+  vendor?: { id: string; orgName: string; commissionPct: string } | null;
   alreadyOpen?: boolean;
   variance?: { amount: Paise; short: boolean; over: boolean; matched: boolean };
 }
@@ -276,7 +300,13 @@ export interface CachedZone {
   allowedVehicleTypeIds: SlotType[];
   openTime: string;
   closeTime: string;
-  status: string;
+  /**
+   * Present on the `/zones` list this cache is primed from; absent from a
+   * `/zones/resolve` answer, whose select does not include it. Resolve only
+   * ever returns OPEN zones — it filters to them before running the geometry —
+   * so a missing status there means "open by construction", not "unknown".
+   */
+  status?: string;
   /**
    * Live occupancy, present only when this came from the server.
    *
@@ -321,231 +351,4 @@ export interface Media {
   sizeBytes: number;
   purpose: string;
   createdAt: string;
-}
-
-/* ────────────────────────────────────────────────────────── citizen app
- *
- * Everything below this line was added for `apps/citizen`. It is separated
- * because a good half of it describes endpoints the server does not have yet:
- * the shapes are written down now so the screens can be built and typed
- * against them, and so that whoever builds the backend has something precise
- * to build against rather than a screenshot.
- *
- * `packages/api/src/gaps.ts` says which is which, and every screen that reads
- * one of the absent endpoints says so on the screen rather than showing a zero.
- */
-
-/** The server's own verdict on whether a zone has room. Never recomputed here. */
-export type Availability = "AVAILABLE" | "LIMITED" | "FULL";
-
-/**
- * One zone as `GET /zones/nearby` returns it.
- *
- * A separate type from `Zone` rather than a reuse, because the two genuinely
- * differ and pretending otherwise would put optional fields on `Zone` that the
- * vendor app relies on being present. Two absences matter to the citizen map:
- *
- *  - There is no `boundary`. The nearby projection does not select it, so the
- *    map cannot draw a real lot footprint from this call alone — see the note
- *    in `components/park-map.tsx` about what it draws instead.
- *  - There is no `status`. The endpoint already filters to OPEN zones, so
- *    everything that comes back is open by construction.
- *
- * `occupied` here is derived from live sessions, not from bay records, so it
- * can disagree with the bay summary. That is not a bug in either: a car park
- * can be running more sessions than it has painted bays.
- */
-export interface NearbyZone {
-  id: string;
-  code: string;
-  name: string;
-  centerLat: number;
-  centerLng: number;
-  capacity: number;
-  openTime: string;
-  closeTime: string;
-  allowedVehicleTypeIds: SlotType[];
-  ward: { name: string } | null;
-  street: { name: string } | null;
-  occupied: number;
-  available: number;
-  occupancyPct: number;
-  availability: Availability;
-  /** Great-circle metres from the point that was searched. */
-  distanceMetres: number;
-}
-
-/**
- * One bay, as `GET /slots` returns it.
- *
- * Sparse on purpose — the Prisma model really does hold nothing else. There is
- * no floor, no level, no coordinates, so a bay grid can only be a grid: the
- * codes carry whatever spatial meaning exists, which is why they are sorted
- * and shown verbatim rather than laid out.
- */
-export interface Slot {
-  id: string;
-  zoneId: string;
-  code: string;
-  type: SlotType;
-  status: SlotStatus;
-  isReserved: boolean;
-  zone: { id: string; code: string; name: string };
-}
-
-/** What `POST /auth/otp/request` answers with. */
-export interface OtpRequested {
-  sent: boolean;
-  expiresInSeconds: number;
-  /**
-   * The code itself, returned only when the server is not in production.
-   *
-   * It exists so a demo build can be signed into without an SMS gateway. The
-   * app shows it plainly labelled as such — quietly filling the field in would
-   * make a test build indistinguishable from a broken one.
-   */
-  devCode?: string;
-}
-
-/** `GET /auth/me` for a citizen. Wider than `Principal`, and the real shape. */
-export interface CitizenProfile {
-  id: string;
-  name: string;
-  email: string | null;
-  phone: string | null;
-  role: string;
-  status: string;
-  permissions: string[];
-  vendorId: string | null;
-  attendantId: string | null;
-  createdAt: string;
-  lastLoginAt: string | null;
-}
-
-/**
- * A vehicle a citizen has told us is theirs.
- *
- * The plate is the join between a citizen and a parking session: a citizen
- * never starts one, an attendant does, so "your car" is found by matching a
- * registered plate against active sessions.
- */
-export interface MyVehicle {
-  id: string;
-  plateNumber: string;
-  makeModel?: string | null;
-  colour?: string | null;
-  vehicleType: { code: SlotType; label: string };
-  isBlacklisted: boolean;
-}
-
-/** One of the citizen's own parking sessions, with what they paid for it. */
-export interface MySession {
-  id: string;
-  code: string;
-  plateNumber: string;
-  status: SessionStatus;
-  startAt: string;
-  endAt: string | null;
-  durationMinutes: number | null;
-  payableAmount: Paise | null;
-  refundedAmount: Paise;
-  zone: { id: string; code: string; name: string };
-  payment: { id: string; mode: PaymentMode; status: string } | null;
-  receipt: { id: string; number: string; issuedAt: string } | null;
-}
-
-/** The figures at the top of the History screen, totalled by the server. */
-export interface MySpendSummary {
-  /** "2026-09" — the month these totals cover. */
-  month: string;
-  totalPaid: Paise;
-  totalRefunded: Paise;
-  sessions: number;
-}
-
-/** A saved car park. The `Favourite` model exists; nothing writes to it yet. */
-export interface Favourite {
-  id: string;
-  zoneId: string;
-  /** "HOME", "OFFICE", or whatever the citizen typed. */
-  label: string;
-  zone: { id: string; code: string; name: string };
-}
-
-/**
- * A wallet balance.
- *
- * Deliberately not a mutable number the client adds to and subtracts from. The
- * server derives it from the ledger every time it is asked, which is the only
- * arrangement under which a balance disputed three months later can be
- * answered — the same reasoning the shift reconciliation already uses.
- */
-export interface WalletBalance {
-  balance: Paise;
-  currency: "INR";
-  /** When the ledger last moved. Not when this response was computed. */
-  updatedAt: string | null;
-}
-
-export type WalletEntryKind =
-  | "TOPUP"
-  | "SESSION_DEBIT"
-  | "REFUND"
-  | "REVERSAL"
-  | "ADJUSTMENT";
-
-/**
- * One row of the ledger.
- *
- * `amount` is signed — credits positive, debits negative — so that a client
- * never has to know which kinds add and which subtract, and a new kind added
- * server-side cannot silently be totalled the wrong way here.
- */
-export interface WalletEntry {
-  id: string;
-  kind: WalletEntryKind;
-  amount: Paise;
-  balanceAfter: Paise;
-  /** Already written for a person to read: "Park Street North", "Added by UPI". */
-  description: string;
-  sessionId: string | null;
-  zone: { id: string; name: string } | null;
-  createdAt: string;
-}
-
-/**
- * A top-up waiting to be paid.
- *
- * The money is not in the wallet when this returns. The credit is written when
- * the gateway's webhook arrives, which is why this carries an order to pay and
- * not a new balance.
- */
-export interface WalletTopUp {
-  id: string;
-  amount: Paise;
-  status: "PENDING" | "CAPTURED" | "FAILED";
-  gatewayKeyId: string;
-  gatewayOrder: { id: string; amount: number; currency: string };
-}
-
-/** A season-ticket plan a citizen could buy. */
-export interface PassPlan {
-  id: string;
-  name: string;
-  description: string | null;
-  amount: Paise;
-  validDays: number;
-  vehicleType: SlotType;
-  zoneId: string | null;
-}
-
-/** A pass the citizen holds, once purchase exists. */
-export interface MyPass {
-  id: string;
-  planName: string;
-  plateNumber: string;
-  status: "PENDING_PAYMENT" | "ACTIVE" | "EXPIRED" | "CANCELLED";
-  validFrom: string;
-  validTo: string;
-  qrCode: string | null;
 }

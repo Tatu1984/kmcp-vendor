@@ -5,40 +5,33 @@ import type {
   CachedHoliday,
   CachedTariff,
   CachedZone,
-  CitizenProfile,
   EndedSession,
-  Favourite,
   LoginResponse,
   Media,
   MediaPurpose,
-  MyPass,
-  MySession,
-  MySpendSummary,
-  MyVehicle,
-  NearbyZone,
-  OtpRequested,
-  Paise,
-  PassPlan,
   Payment,
   PlateLookup,
   Session,
   Shift,
-  Slot,
   SlotSummary,
   SlotType,
   UploadTicket,
-  WalletBalance,
-  WalletEntry,
-  WalletTopUp,
+  VerifyPayment,
   Zone,
 } from "./types";
 
 /**
- * Every call the field apps make.
+ * Every call the attendant app makes.
  *
  * The ones that change something go through the queue; the ones that only read
  * go straight out, because stale reads are cheap and a queued read is useless.
+ *
+ * Nothing here is wired for a screen that does not exist. This package was
+ * once shared with the citizen app and carried its half-built routes; that app
+ * now lives in its own repository with its own copy, and the residue was
+ * removed rather than left as a second source of drift.
  */
+
 /**
  * The largest page the API will answer.
  *
@@ -73,13 +66,6 @@ async function fetchAll<T>(
 export function createApi(client: ApiClient, queue: OfflineQueue) {
   return {
     auth: {
-      login: (email: string, password: string, deviceFingerprint: string) =>
-        client.post<LoginResponse>(
-          "/auth/login",
-          { email, password, deviceFingerprint, platform: "android" },
-          { anonymous: true },
-        ),
-
       loginWithPhone: (phone: string, password: string, deviceFingerprint: string) =>
         client.post<LoginResponse>(
           "/auth/login",
@@ -87,36 +73,24 @@ export function createApi(client: ApiClient, queue: OfflineQueue) {
           { anonymous: true },
         ),
 
-      me: () => client.get<Record<string, unknown>>("/auth/me"),
-
       /**
-       * Sends a citizen a six-digit code by SMS.
+       * Completes a sign-in that `loginWithPhone` answered with
+       * `two_factor_required`.
        *
-       * The only field the server accepts is the phone number — it normalises
-       * to +91 itself, so there is no country code to send and no device to
-       * name. Rate limited to five requests in five minutes per install, which
-       * is why the screen that calls this shows a countdown rather than a
-       * button that can be hammered.
+       * Anonymous like the login itself: there is no token yet, the challenge
+       * id is what ties this to the password that was just accepted. The
+       * device fingerprint is not resent — the server kept it with the
+       * challenge, so the binding it makes is to the handset that entered the
+       * password, not to whichever one enters the code.
        */
-      requestOtp: (phone: string) =>
-        client.post<OtpRequested>("/auth/otp/request", { phone }, { anonymous: true }),
-
-      /**
-       * Exchanges the code for a token pair, creating the account on the first
-       * ever verification.
-       *
-       * `deviceFingerprint` is deliberately not sent. Passing one makes the
-       * server bind this handset to the account, which is the right rule for a
-       * depot handset that must not be shared and precisely the wrong one for
-       * the public — a citizen replacing a broken phone, or signing in on a
-       * borrowed one, is ordinary behaviour and must not need a supervisor.
-       */
-      verifyOtp: (phone: string, code: string, platform: "ios" | "android") =>
+      verifyTwoFactor: (challengeId: string, code: string) =>
         client.post<LoginResponse>(
-          "/auth/otp/verify",
-          { phone, code, platform },
+          "/auth/two-factor/verify",
+          { challengeId, code },
           { anonymous: true },
         ),
+
+      me: () => client.get<Record<string, unknown>>("/auth/me"),
 
       logout: (refreshToken: string) =>
         client.post("/auth/logout", { refreshToken }, { anonymous: true }),
@@ -128,42 +102,13 @@ export function createApi(client: ApiClient, queue: OfflineQueue) {
        *
        * The server answers whenever it can be reached, and its answer is the
        * one that counts. Offline this falls back to the same geometry run
-       * against cached boundaries — see `resolveZoneOffline`.
+       * against cached boundaries — see `resolveZone` in `offline.ts`.
        */
       resolve: (lat: number, lng: number) =>
         client.get<Zone & { alternatives: { id: string; code: string; name: string }[] }>(
           "/zones/resolve",
           { query: { lat, lng } },
         ),
-
-      /**
-       * Open car parks around a point, nearest first.
-       *
-       * The one door in this API that is genuinely public — it carries
-       * `@Public()` on the server, so the citizen map draws before anybody has
-       * signed in, which is the whole reason a stranger can open this app and
-       * find a space. It answers with `NearbyZone`, which is a thinner thing
-       * than `Zone`: no boundary, and no status, because the endpoint has
-       * already filtered to zones that are open.
-       *
-       * The default radius is two kilometres, matching the server's own
-       * default. Five hundred metres is a reasonable walk; two kilometres is
-       * what somebody driving actually wants to see.
-       */
-      nearby: (lat: number, lng: number, radius = 2000, limit = 20) =>
-        client.get<NearbyZone[]>("/zones/nearby", {
-          query: { lat, lng, radius, limit },
-          anonymous: true,
-        }),
-
-      /**
-       * One zone in full, boundary included.
-       *
-       * Guarded by `zone.read`, which a citizen does not hold — see
-       * `gaps.ts`. Wired anyway, because the day a public zone view exists
-       * this is the call the car park screen already makes.
-       */
-      byId: (zoneId: string) => client.get<CachedZone>(`/zones/${encodeURIComponent(zoneId)}`),
 
       /**
        * Every zone this attendant may work, with boundaries, for the cache.
@@ -199,7 +144,8 @@ export function createApi(client: ApiClient, queue: OfflineQueue) {
        *
        * The Today screen buckets these by hour. Asking the server for the day
        * and folding it here costs one request; asking per hour would cost ten
-       * and still need folding.
+       * and still need folding. No status filter, so OVERSTAY rows are in the
+       * count like any other.
        */
       today: (attendantId: string) => {
         const midnight = new Date();
@@ -211,10 +157,29 @@ export function createApi(client: ApiClient, queue: OfflineQueue) {
         );
       },
 
-      mine: (attendantId: string) =>
-        client.get<Session[]>("/sessions", {
-          query: { attendantId, status: "ACTIVE", pageSize: 100 },
-        }),
+      /**
+       * What this attendant has parked right now.
+       *
+       * Two requests, not one. A session that runs past the overstay threshold
+       * is promoted from ACTIVE to OVERSTAY on the server, and the list route's
+       * `status` filter takes exactly one value — so asking for ACTIVE alone
+       * silently dropped every overstaying vehicle, which is precisely the set
+       * the Kerb screen's overstay count exists to show. Asking with no filter
+       * would return the day's completed sessions first and push a car parked
+       * this morning off the page. A page of each live status keeps the server
+       * doing the filtering and the list complete.
+       */
+      mine: async (attendantId: string) => {
+        const [active, overstay] = await Promise.all([
+          client.get<Session[]>("/sessions", {
+            query: { attendantId, status: "ACTIVE", pageSize: MAX_PAGE_SIZE },
+          }),
+          client.get<Session[]>("/sessions", {
+            query: { attendantId, status: "OVERSTAY", pageSize: MAX_PAGE_SIZE },
+          }),
+        ]);
+        return [...active, ...overstay];
+      },
 
       /**
        * Starts a session. Queued when offline — the clientEventId is what makes
@@ -272,141 +237,16 @@ export function createApi(client: ApiClient, queue: OfflineQueue) {
       },
 
       /**
-       * A citizen paying for their own session by UPI.
+       * Hands the gateway's signed result back so the server can capture it.
        *
-       * The same route the attendant uses, and the amount is never sent — the
-       * server prices the session and charges what it is owed. That is the
-       * point: a handset that could name its own figure is a handset that can
-       * decide what parking costs.
-       *
-       * Guarded by `session.read` today, which a citizen does not hold, so
-       * this answers 403 until a citizen-scoped payment route exists. See
-       * `MISSING.payment`.
+       * The signature is computed with a secret this handset has never held,
+       * which is what stops a forged "paid" from capturing anything. The
+       * webhook remains the authority; this exists so the attendant sees a
+       * receipt while the driver is still standing there rather than after
+       * the webhook lands.
        */
-      payOwnSession: (sessionId: string, mode: "UPI_INTENT" | "UPI_QR" = "UPI_INTENT") =>
-        client.post<Payment>("/payments/collect", {
-          sessionId,
-          mode,
-          idempotencyKey: newEventId(),
-        }),
-    },
-
-    /**
-     * The citizen's own things.
-     *
-     * Every route under `/me` is scoped by the token and takes no user id —
-     * an app that has to name whose sessions it wants is an app one query
-     * parameter away from reading somebody else's.
-     *
-     * Only `profile` works today. The rest are typed against routes that do
-     * not exist yet; the tables behind all of them do, and each one is a
-     * scoped read over indexes that are already there. `MISSING` in
-     * `gaps.ts` names them, and every screen that calls one says on screen
-     * that it is waiting rather than showing an empty list as if it were the
-     * truth.
-     */
-    me: {
-      /** Real, and the only authenticated call a citizen can make today. */
-      profile: () => client.get<CitizenProfile>("/auth/me"),
-
-      /** NOT BUILT — `GET /me/vehicles`. See `MISSING.myVehicles`. */
-      vehicles: () => client.get<MyVehicle[]>("/me/vehicles"),
-
-      /** NOT BUILT — `POST /me/vehicles`. See `MISSING.myVehicles`. */
-      addVehicle: (plateNumber: string, vehicleType: SlotType) =>
-        client.post<MyVehicle>("/me/vehicles", { plateNumber, vehicleType }),
-
-      /** NOT BUILT — `DELETE /me/vehicles/:id`. See `MISSING.myVehicles`. */
-      removeVehicle: (vehicleId: string) =>
-        client.delete<void>(`/me/vehicles/${encodeURIComponent(vehicleId)}`),
-
-      /**
-       * NOT BUILT — `GET /me/sessions`. See `MISSING.mySessions`.
-       *
-       * Both the History screen and "where is my car" read this. Passing
-       * `status: "ACTIVE"` is how the app finds a car an attendant has
-       * started a session for; a citizen never starts one themselves.
-       */
-      sessions: (status?: "ACTIVE" | "COMPLETED") =>
-        client.get<MySession[]>("/me/sessions", { query: { status, pageSize: 50 } }),
-
-      /** NOT BUILT — `GET /me/summary`. The two figures at the top of History. */
-      summary: (month?: string) =>
-        client.get<MySpendSummary>("/me/summary", { query: { month } }),
-
-      /** NOT BUILT — `GET /me/payments`. See `MISSING.myPayments`. */
-      payments: () => client.get<Payment[]>("/me/payments", { query: { pageSize: 50 } }),
-
-      /** NOT BUILT — `GET /me/favourites`. The `Favourite` model already exists. */
-      favourites: () => client.get<Favourite[]>("/me/favourites"),
-
-      /** NOT BUILT — `POST /me/favourites`. See `MISSING.favourites`. */
-      addFavourite: (zoneId: string, label = "SAVED") =>
-        client.post<Favourite>("/me/favourites", { zoneId, label }),
-
-      /** NOT BUILT — `DELETE /me/favourites/:zoneId`. */
-      removeFavourite: (zoneId: string) =>
-        client.delete<void>(`/me/favourites/${encodeURIComponent(zoneId)}`),
-
-      /** NOT BUILT — `GET /me/passes`. The `Pass` model exists and carries a QR. */
-      passes: () => client.get<MyPass[]>("/me/passes"),
-    },
-
-    /**
-     * The wallet. None of this exists on the server in any form.
-     *
-     * `WALLET` is a value in the `PaymentMode` enum and nothing else — there
-     * is no balance column, no ledger table, no top-up and no refund path. The
-     * shapes are written down here because the screens had to be built against
-     * something, and because the arrangement matters: `balance()` is a derived
-     * figure the server computes from `entries()`, never a mutable number this
-     * client adds to. A wallet whose balance is stored rather than derived is a
-     * wallet whose disputes cannot be answered.
-     *
-     * Worth knowing before any of it is written: holding citizens' money makes
-     * KMC a prepaid instrument issuer under RBI's rules. That is a decision for
-     * whoever owns the contract.
-     */
-    wallet: {
-      /** NOT BUILT — `GET /me/wallet`. See `MISSING.wallet`. */
-      balance: () => client.get<WalletBalance>("/me/wallet"),
-
-      /** NOT BUILT — `GET /me/wallet/entries`. The ledger, newest first. */
-      entries: () =>
-        client.get<WalletEntry[]>("/me/wallet/entries", { query: { pageSize: 50 } }),
-
-      /**
-       * NOT BUILT — `POST /me/wallet/topups`.
-       *
-       * Returns an order to pay, not a new balance: the credit is written when
-       * the gateway's webhook arrives, so that money is never in the wallet
-       * before it is in the account.
-       */
-      topUp: (amount: Paise) => client.post<WalletTopUp>("/me/wallet/topups", { amount }),
-
-      /**
-       * NOT BUILT — `POST /me/wallet/payments`.
-       *
-       * Debits the wallet for a session the server prices. No amount is sent,
-       * for the same reason it is not sent to `/payments/collect`.
-       */
-      paySession: (sessionId: string) =>
-        client.post<Payment>("/me/wallet/payments", {
-          sessionId,
-          idempotencyKey: newEventId(),
-        }),
-    },
-
-    passes: {
-      /**
-       * Season-ticket plans. The route exists but is guarded by `tariff.read`,
-       * so a citizen is refused — one more door to open, not one to build.
-       */
-      plans: () => client.get<PassPlan[]>("/pass-plans", { query: { pageSize: 50 } }),
-
-      /** NOT BUILT — `POST /me/passes`. See `MISSING.passPurchase`. */
-      purchase: (planId: string, plateNumber: string) =>
-        client.post<MyPass>("/me/passes", { planId, plateNumber }),
+      verify: (paymentId: string, input: VerifyPayment) =>
+        client.post<Payment>(`/payments/${encodeURIComponent(paymentId)}/verify`, input),
     },
 
     slots: {
@@ -416,23 +256,6 @@ export function createApi(client: ApiClient, queue: OfflineQueue) {
        */
       summary: (zoneId: string) =>
         client.get<SlotSummary>(`/slots/summary/${encodeURIComponent(zoneId)}`),
-
-      /**
-       * Every bay in a zone, for the grid.
-       *
-       * Sorted by code because the code is the only spatial information a
-       * `Slot` carries — there is no floor, no level and no coordinates on the
-       * model — so A01 next to A02 is the closest thing to a plan of the car
-       * park that exists.
-       *
-       * Paged rather than fetched whole: 500 was refused outright by the API,
-       * which caps a page at 100. A large car park therefore costs a few
-       * requests, and the grid still arrives complete.
-       */
-      list: (zoneId: string) =>
-        fetchAll<Slot>((page, pageSize) =>
-          client.get<Slot[]>("/slots", { query: { zoneId, page, pageSize, sort: "code" } }),
-        ),
     },
 
     shifts: {
