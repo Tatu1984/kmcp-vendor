@@ -89,6 +89,15 @@ export interface Session {
   code: string;
   zoneId: string;
   slotId?: string | null;
+  /**
+   * The bay the vehicle was put in, when one was allocated.
+   *
+   * Carried beside `slotId` because an id is not a label: the code is what is
+   * painted on the ground, and it is the only form of this an attendant can
+   * check against the kerb in front of them. Absent on sessions started before
+   * bays were allocated, and in the many zones that have none recorded.
+   */
+  slot?: { id: string; code: string } | null;
   plateNumber: string;
   status: SessionStatus;
   startAt: string;
@@ -239,6 +248,28 @@ export interface SlotSummary {
 }
 
 export type SlotStatus = "AVAILABLE" | "OCCUPIED" | "RESERVED" | "OUT_OF_SERVICE";
+
+/**
+ * One bay, as `GET /slots` returns it.
+ *
+ * `code` is what is painted on the ground and the only spatial information the
+ * model carries — there is no level, no bearing and no coordinates — so sorting
+ * by it is the closest thing to a plan of the kerb that exists.
+ *
+ * `isReserved` is a designation, not a status: the bay is set aside in the
+ * zone's records, which is a different fact from whether anything is parked in
+ * it now. `status` answers the second question, and the two are independent —
+ * a bay can be marked reserved and stand empty at the same time.
+ */
+export interface Slot {
+  id: string;
+  zoneId: string;
+  code: string;
+  type: SlotType;
+  status: SlotStatus;
+  isReserved: boolean;
+  zone: { id: string; code: string; name: string };
+}
 
 /** Count for one bay status, or 0 when the server did not mention it. */
 export function slotsWith(summary: SlotSummary | null, status: SlotStatus): number {

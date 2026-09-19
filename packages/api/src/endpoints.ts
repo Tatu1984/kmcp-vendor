@@ -13,6 +13,8 @@ import type {
   PlateLookup,
   Session,
   Shift,
+  Slot,
+  SlotStatus,
   SlotSummary,
   SlotType,
   UploadTicket,
@@ -256,6 +258,34 @@ export function createApi(client: ApiClient, queue: OfflineQueue) {
        */
       summary: (zoneId: string) =>
         client.get<SlotSummary>(`/slots/summary/${encodeURIComponent(zoneId)}`),
+
+      /**
+       * The bays themselves, so an attendant can put a vehicle in a named one.
+       *
+       * Paged, for the reason at the top of this file: `pageSize` above 100 is
+       * refused with a 400 rather than clamped. `sort` is sent rather than left
+       * to the server's default, because paging a list whose order is only
+       * implicit is how a bay comes back twice, or not at all.
+       *
+       * `status` and `type` are the server's own filters, offered because a
+       * caller that wants only the free bays should not pay for the occupied
+       * ones. The bay picker passes neither on purpose: it has to tell "no bays
+       * recorded for a car" apart from "every car bay is taken", and that needs
+       * the taken ones counted.
+       */
+      list: (zoneId: string, filter: { status?: SlotStatus; type?: SlotType } = {}) =>
+        fetchAll<Slot>((page, pageSize) =>
+          client.get<Slot[]>("/slots", {
+            query: {
+              zoneId,
+              status: filter.status,
+              type: filter.type,
+              page,
+              pageSize,
+              sort: "code",
+            },
+          }),
+        ),
     },
 
     shifts: {

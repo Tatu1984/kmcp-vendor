@@ -7,6 +7,7 @@ import {
   normalisePlate,
   resolveZone,
   type CachedZone,
+  type Slot,
   type SlotType,
 } from "@kmcp/api";
 
@@ -31,12 +32,37 @@ const VEHICLE_LABELS: Record<SlotType, string> = {
 };
 
 /**
+ * The zone's bays, or the reason there are none to offer.
+ *
+ * Three states rather than a list and a loading flag, because "still looking",
+ * "the list could not be fetched" and "the list came back empty" lead to three
+ * different sentences on screen and only one of them may hold the start button.
+ * `null` means no zone has resolved yet, so nothing has been asked for.
+ */
+type BayList =
+  | { status: "loading" }
+  | { status: "unavailable"; because: string }
+  | { status: "ready"; bays: Slot[] };
+
+/**
+ * Bays in the order they are painted.
+ *
+ * The server sorts `code` as a byte comparison, which runs A1, A10, A2 — a grid
+ * in that order is unreadable beside a kerb where the numbers go up. The code is
+ * the only spatial information a bay carries, so this is the whole of the layout.
+ */
+const byCode = (a: Slot, b: Slot) => a.code.localeCompare(b.code, "en", { numeric: true });
+
+/**
  * Starting a session.
  *
- * Four things in one screen because a driver is waiting: where you are, what
- * the plate says, what kind of vehicle it is, and a photograph. The zone is
- * resolved from GPS rather than chosen, so an attendant cannot accidentally
- * book a car into the zone next door where the tariff is different.
+ * Five things in one screen because a driver is waiting: where you are, what
+ * the plate says, what kind of vehicle it is, which bay it goes in, and a
+ * photograph. The zone is resolved from GPS rather than chosen, so an attendant
+ * cannot accidentally book a car into the zone next door where the tariff is
+ * different. The bay is the opposite — picked, not assigned, because the person
+ * standing on the kerb can see which space the vehicle actually fits in and the
+ * server cannot.
  *
  * Nothing here computes a price. The server prices it, refuses it, or accepts
  * it — this screen only reports what was observed.
@@ -57,10 +83,58 @@ export default function StartSession() {
   const [zoneError, setZoneError] = React.useState<{ title: string; body: string } | null>(null);
   const [plate, setPlate] = React.useState("");
   const [vehicleType, setVehicleType] = React.useState<SlotType>("CAR");
+  const [bayList, setBayList] = React.useState<BayList | null>(null);
+  const [slotId, setSlotId] = React.useState<string | null>(null);
   const [capture, setCapture] = React.useState<Capture | null>(null);
   const [cameraOpen, setCameraOpen] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
   const [busy, setBusy] = React.useState(false);
+
+  /**
+   * Which bay fetch is the current one.
+   *
+   * The zone re-resolves on every new GPS fix, and a slow reply for the zone
+   * the attendant has walked out of must not land on top of the one they are
+   * standing in — they would be offered bays from the wrong kerb, and the
+   * server accepts whatever bay it is sent.
+   */
+  const bayRequest = React.useRef(0);
+
+  const loadBays = React.useCallback(async (zoneId: string, resolvedOffline: boolean) => {
+    const ticket = (bayRequest.current += 1);
+    const settle = (next: BayList) => {
+      if (bayRequest.current === ticket) setBayList(next);
+    };
+
+    if (resolvedOffline) {
+      // The zone itself came from the cache, so the server could not be reached
+      // seconds ago. Bays are deliberately not cached — occupancy changes by
+      // the minute and a stale bay map would hand out a space somebody is
+      // parked in — and spending twenty seconds of request timeout to discover
+      // there is still no signal is time the driver waits for nothing.
+      settle({
+        status: "unavailable",
+        because:
+          "There is no signal, and bays are not held on this handset — a stale bay map would send a vehicle into a space that is taken.",
+      });
+      return;
+    }
+
+    settle({ status: "loading" });
+    try {
+      // Every bay, not only the free ones. The vehicle chips above can change
+      // after this lands, and telling "no bays recorded for a car" apart from
+      // "every car bay is taken" means counting the taken ones.
+      const found = await api.slots.list(zoneId);
+      settle({ status: "ready", bays: [...found].sort(byCode) });
+    } catch (cause) {
+      settle({
+        status: "unavailable",
+        because:
+          cause instanceof ApiError ? cause.message : "The bays in this zone could not be listed.",
+      });
+    }
+  }, []);
 
   // Resolve the zone as soon as there is a fix. The attendant should find the
   // answer already on screen when they look up from the number plate.
@@ -81,12 +155,17 @@ export default function StartSession() {
             title: "Not in a parking zone",
             body: "You are not inside any zone you are assigned to. Move to the kerb you are working.",
           });
+          // Bumped rather than merely cleared, so a bay fetch still in flight
+          // for the zone we have just left cannot repopulate the picker.
+          bayRequest.current += 1;
+          setBayList(null);
           return;
         }
 
         setZone(resolved.zone);
         setZoneOffline(resolved.offline);
         setZoneError(null);
+        void loadBays(resolved.zone.id, resolved.offline);
 
         const allowed = resolved.zone.allowedVehicleTypeIds ?? [];
         // Default to the commonest permitted type rather than to CAR, which a
@@ -103,13 +182,15 @@ export default function StartSession() {
           title: "The server could not place you",
           body: cause instanceof ApiError ? cause.message : "Could not work out which zone you are in.",
         });
+        bayRequest.current += 1;
+        setBayList(null);
       }
     })();
 
     return () => {
       cancelled = true;
     };
-  }, [location.status, location.status === "ready" ? location.fix.lat : 0, location.status === "ready" ? location.fix.lng : 0]);
+  }, [location.status, location.status === "ready" ? location.fix.lat : 0, location.status === "ready" ? location.fix.lng : 0, loadBays]);
 
   const normalised = normalisePlate(plate);
   const plateLooksRight = /^[A-Z]{2}\d{1,2}[A-Z]{0,3}\d{1,4}$/.test(normalised);
@@ -117,7 +198,67 @@ export default function StartSession() {
     ? zone.allowedVehicleTypeIds
     : (Object.keys(VEHICLE_LABELS) as SlotType[]);
 
-  const canStart = Boolean(zone) && plateLooksRight && !busy;
+  const bays = bayList?.status === "ready" ? bayList.bays : null;
+
+  /**
+   * The bays of the type on screen, and of those the ones actually free.
+   *
+   * Filtered on the handset rather than asked of the server, because the
+   * vehicle chips change after the fetch has landed and a refetch per chip tap
+   * is a request the attendant waits on to see a list already in hand.
+   *
+   * AVAILABLE is not decoration here. The server takes `slotId` on trust and
+   * flips that bay to OCCUPIED without checking it was free, so offering a bay
+   * that already holds a vehicle would overwrite its record — and then release
+   * the bay the moment the *other* session ended, with a car still in it.
+   */
+  const baysOfType = React.useMemo(
+    () => (bays ?? []).filter((bay) => bay.type === vehicleType),
+    [bays, vehicleType],
+  );
+  const freeBays = React.useMemo(
+    () => baysOfType.filter((bay) => bay.status === "AVAILABLE"),
+    [baysOfType],
+  );
+
+  /**
+   * Drops a bay the current vehicle type cannot use.
+   *
+   * The type can be corrected after a bay has been picked, and a two-wheeler
+   * bay left selected under CAR would be sent as `slotId` and accepted — the
+   * server does not check the bay against the vehicle. Also covers a bay that
+   * stopped being free between the fetch and the tap.
+   */
+  React.useEffect(() => {
+    setSlotId((current) => (current && freeBays.some((bay) => bay.id === current) ? current : null));
+  }, [freeBays]);
+
+  /**
+   * A zone is on screen but its bays are not settled yet.
+   *
+   * `null` and "loading" are folded together deliberately: both mean the answer
+   * is not in, and keeping them apart left a gap in which an unfetched list
+   * would have been reported as "no bays recorded here" — a sentence that would
+   * have been a lie and would have let the start through without a bay.
+   */
+  const baysPending = Boolean(zone) && (bayList === null || bayList.status === "loading");
+
+  /**
+   * A bay is required only when there is one to require.
+   *
+   * Many zones have fewer bays mapped than their priced capacity, and some have
+   * none at all — the server reports bays and active sessions as separate counts
+   * for exactly that reason. A zone with no free bay of this type still has to
+   * be workable, so the requirement follows the list rather than the product's
+   * wish for one.
+   */
+  const bayRequired = freeBays.length > 0;
+  const canStart =
+    Boolean(zone) &&
+    plateLooksRight &&
+    !busy &&
+    !baysPending &&
+    (!bayRequired || slotId !== null);
 
   async function start() {
     if (!zone) return;
@@ -145,6 +286,10 @@ export default function StartSession() {
         vehicleType,
         location: location.status === "ready" ? { lat: location.fix.lat, lng: location.fix.lng } : undefined,
         evidenceMediaId,
+        // Absent rather than null when no bay was allocated: the start schema
+        // takes an optional string, and a zone with no bays recorded must send
+        // nothing at all rather than a field the server has to interpret.
+        slotId: slotId ?? undefined,
       });
 
       await refreshShift();
@@ -268,6 +413,83 @@ export default function StartSession() {
         </View>
       </View>
 
+      {/* ------------------------------------------------------------- bay */}
+      {zone ? (
+        <View style={styles.section}>
+          <View style={styles.bayHead}>
+            <Text style={styles.sectionLabel}>BAY</Text>
+            {baysOfType.length > 0 ? (
+              <Text style={styles.bayCount}>
+                {freeBays.length} free of {baysOfType.length}
+              </Text>
+            ) : null}
+          </View>
+
+          {baysPending ? (
+            <Text style={styles.bayNote}>Finding which bays are free…</Text>
+          ) : bayList?.status === "unavailable" ? (
+            <>
+              <Banner
+                tone="warning"
+                title="No bay list for this zone"
+                body={`${bayList.because} Start the session without one — the vehicle is booked to the zone, which is what the server checks anyway.`}
+              />
+              {/*
+                Asks the network even when the zone itself came from the cache:
+                the signal may have returned in the seconds since, and this is
+                the only way back to a bay list short of walking out of the zone
+                and back in.
+              */}
+              <Button
+                label="Look for bays again"
+                variant="secondary"
+                size="medium"
+                onPress={() => void loadBays(zone.id, false)}
+                disabled={busy}
+              />
+            </>
+          ) : bays && bays.length === 0 ? (
+            <Banner
+              tone="info"
+              title="This zone has no numbered bays"
+              body="Its capacity is priced and enforced without them — many kerbs have never been surveyed and painted. Start the session; the vehicle is booked to the zone rather than to a bay."
+            />
+          ) : baysOfType.length === 0 ? (
+            <Banner
+              tone="info"
+              title={`No ${VEHICLE_LABELS[vehicleType] ?? vehicleType} bay is recorded here`}
+              body="The bays mapped in this zone are for other vehicle types. Start the session; the vehicle is booked to the zone rather than to a bay."
+            />
+          ) : freeBays.length === 0 ? (
+            <Banner
+              tone="warning"
+              title={`Every ${VEHICLE_LABELS[vehicleType] ?? vehicleType} bay here is taken`}
+              body={`All ${baysOfType.length} are occupied, reserved or out of service. You can still start the session — what the server refuses on is the zone being full, not its bay map.`}
+            />
+          ) : (
+            <>
+              <View style={styles.bayGrid}>
+                {freeBays.map((bay) => (
+                  <BayCell
+                    key={bay.id}
+                    bay={bay}
+                    selected={bay.id === slotId}
+                    disabled={busy}
+                    onPress={() => setSlotId(bay.id)}
+                  />
+                ))}
+              </View>
+              {freeBays.some((bay) => bay.isReserved) ? (
+                <Text style={styles.bayNote}>
+                  A bay marked RESERVED is empty now but set aside in the zone's records. Nothing
+                  refuses it — look at the kerb before putting a casual vehicle in one.
+                </Text>
+              ) : null}
+            </>
+          )}
+        </View>
+      ) : null}
+
       {/* ---------------------------------------------------- photograph */}
       <Button
         label={capture ? "Photograph taken — retake" : "Photograph the plate"}
@@ -278,6 +500,18 @@ export default function StartSession() {
       />
 
       {error ? <Banner tone="warning" title={error} /> : null}
+
+      {/*
+        Why the button is not ready, said out loud. A start button that is
+        simply grey teaches an attendant to tap it twice and then restart the
+        app; the requirement to pick a bay is a product decision, so it is
+        worth a sentence.
+      */}
+      {baysPending ? (
+        <Text style={styles.requirement}>Checking which bays are free before this can start.</Text>
+      ) : bayRequired && !slotId ? (
+        <Text style={styles.requirement}>Pick a bay above before starting.</Text>
+      ) : null}
 
       <View style={styles.actions}>
         <Button label="Start parking" onPress={() => void start()} disabled={!canStart} busy={busy} />
@@ -299,6 +533,52 @@ export default function StartSession() {
         }}
       />
     </ScrollView>
+  );
+}
+
+/**
+ * One free bay, as a button.
+ *
+ * The code is the whole label because the code is what is painted on the
+ * ground — the id is a cuid nobody can read off a kerb — and it is what the
+ * attendant will say to the driver. Sized like every other target in this app:
+ * tapped in a hurry, outdoors, sometimes through gloves.
+ */
+function BayCell({
+  bay,
+  selected,
+  disabled,
+  onPress,
+}: {
+  bay: Slot;
+  selected: boolean;
+  disabled?: boolean;
+  onPress: () => void;
+}) {
+  return (
+    <Pressable
+      accessibilityRole="radio"
+      accessibilityLabel={`Bay ${bay.code}${bay.isReserved ? ", marked reserved" : ""}`}
+      accessibilityState={{ selected, disabled: Boolean(disabled) }}
+      onPress={onPress}
+      disabled={disabled}
+      style={({ pressed }) => [
+        styles.bay,
+        selected && styles.baySelected,
+        pressed && !disabled && styles.chipPressed,
+      ]}
+    >
+      <Text
+        style={[styles.bayCode, selected && styles.bayCodeSelected]}
+        numberOfLines={1}
+        adjustsFontSizeToFit
+      >
+        {bay.code}
+      </Text>
+      {bay.isReserved ? (
+        <Text style={[styles.bayFlag, selected && styles.bayFlagSelected]}>RESERVED</Text>
+      ) : null}
+    </Pressable>
   );
 }
 
@@ -327,5 +607,32 @@ const styles = StyleSheet.create({
   chipPressed: { opacity: 0.8 },
   chipLabel: { ...theme.text.body, color: theme.colour.textMuted },
   chipLabelSelected: { color: theme.colour.primaryText, fontWeight: "700" },
+
+  bayHead: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
+  bayCount: { ...theme.text.small, color: theme.colour.textMuted },
+  bayNote: { ...theme.text.small, color: theme.colour.textMuted },
+  bayGrid: { flexDirection: "row", flexWrap: "wrap", gap: theme.space(1) },
+  bay: {
+    // Four across, not the six the citizen app uses for its read-only grid: a
+    // sixth of the width is legible on a phone held at reading distance and not
+    // through gloves in Kolkata sun. Four cells and the three gaps between them
+    // fit one row on the narrowest handset, so the last one never wraps alone.
+    flexBasis: "22.5%",
+    flexGrow: 0,
+    minHeight: 56,
+    alignItems: "center",
+    justifyContent: "center",
+    borderRadius: theme.radius.md,
+    borderWidth: 1,
+    borderColor: theme.colour.border,
+    backgroundColor: theme.colour.surface,
+  },
+  baySelected: { backgroundColor: theme.colour.primary, borderColor: theme.colour.primary },
+  bayCode: { fontSize: 19, fontWeight: "700", color: theme.colour.text },
+  bayCodeSelected: { color: theme.colour.primaryText },
+  bayFlag: { ...theme.text.small, fontSize: 10, letterSpacing: 0.4, color: theme.colour.warning },
+  bayFlagSelected: { color: theme.colour.primaryText },
+  requirement: { ...theme.text.small, color: theme.colour.warning },
+
   actions: { gap: theme.space(1), marginTop: theme.space(1) },
 });

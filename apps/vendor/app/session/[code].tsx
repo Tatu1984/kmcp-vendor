@@ -1,5 +1,6 @@
 import * as React from "react";
-import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
+import { Pressable, ScrollView, StyleSheet, Text, View, useWindowDimensions } from "react-native";
+import QRCode from "react-native-qrcode-svg";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import {
   ApiError,
@@ -18,6 +19,7 @@ import { Banner, Button, Card, Loading, Pill, Plate, Row, Stat } from "../../com
 import { PlateCamera, type Capture } from "../../components/plate-camera";
 import { api, cache } from "../../lib/api";
 import { useRazorpayCheckout } from "../../lib/checkout";
+import { elapsedMinutesSince, useNow } from "../../lib/elapsed";
 import { useLocation } from "../../lib/location";
 import { useSession } from "../../lib/session";
 import { theme } from "../../lib/theme";
@@ -38,9 +40,22 @@ import { theme } from "../../lib/theme";
  */
 type CollectMode = "CASH" | "UPI";
 
+/**
+ * The three colours the QR card uses instead of the theme's.
+ *
+ * Everything else in this app is light type on near-black, and a camera cannot
+ * read a QR code rendered that way round — a scanner wants dark modules on a
+ * light field. So the code gets its own white card, and the type on it has to
+ * be dark to match.
+ */
+const QR_LIGHT = "#FFFFFF";
+const QR_DARK = "#0B1220";
+const QR_MUTED = "#475569";
+
 export default function SessionScreen() {
   const { code } = useLocalSearchParams<{ code: string }>();
   const router = useRouter();
+  const { width } = useWindowDimensions();
   const { refreshShift } = useSession();
   const location = useLocation(false);
   const checkout = useRazorpayCheckout();
@@ -82,6 +97,14 @@ export default function SessionScreen() {
   // `Session`, so both "no key" and "key with nothing in it" mean no breakdown.
   const quote = session && "quote" in session ? (session.quote ?? null) : null;
   const running = session?.status === "ACTIVE" || session?.status === "OVERSTAY";
+  /**
+   * The clock runs only while the session does.
+   *
+   * Once the parking has ended its duration is a settled fact, and a figure
+   * still ticking on the screen that is about to show a receipt would keep
+   * disagreeing with the fare printed on it.
+   */
+  const now = useNow(running);
   // The server's figure whenever there is one; the provisional estimate only
   // when there is not.
   const owed = session?.payableAmount ?? estimate?.payableAmount ?? null;
@@ -253,6 +276,31 @@ export default function SessionScreen() {
 
   if (!session) return <Loading label="Loading session…" />;
 
+  /**
+   * How long the vehicle has been parked.
+   *
+   * Counted on this handset from the `startAt` the server recorded, so the
+   * figure moves while somebody is looking at it instead of sitting frozen at
+   * whatever it was when the screen opened. Once the session has ended the
+   * server's `durationMinutes` stands, because that is the figure the fare was
+   * priced on. An end that queued has no server duration yet, so the locally
+   * recorded `endAt` fills in until it syncs.
+   */
+  const parkedMinutes = running
+    ? (elapsedMinutesSince(session.startAt, now) ?? session.elapsedMinutes ?? null)
+    : (session.durationMinutes ??
+      (session.endAt ? elapsedMinutesSince(session.startAt, Date.parse(session.endAt)) : null));
+
+  /**
+   * As wide as the card will let it be.
+   *
+   * This is held up to a driver's phone, sometimes in full sun, so the modules
+   * want every pixel the handset can give them: the screen's width less the
+   * padding around the scroll and the padding inside the card. Capped so it
+   * stops short of filling a tablet.
+   */
+  const qrSize = Math.min(width - theme.space(8), 288);
+
   const collectLabel =
     owed === null
       ? ""
@@ -273,16 +321,55 @@ export default function SessionScreen() {
         </View>
         <Text style={styles.code}>{session.code}</Text>
         <View style={styles.stats}>
-          <Stat
-            label="Parked for"
-            value={formatDuration(session.elapsedMinutes ?? session.durationMinutes)}
-          />
+          <Stat label="Parked for" value={formatDuration(parkedMinutes)} />
           <Stat label="Since" value={formatTime(session.startAt)} />
+          {/*
+            Shown only when there is one. Zones with no bays recorded, and every
+            session started before bays were allocated at all, have nothing to
+            put here — and a "Bay —" on all of them would be noise the attendant
+            reads past.
+          */}
+          {session.slot?.code ? <Stat label="Bay" value={session.slot.code} /> : null}
         </View>
+        {running ? (
+          <Text style={styles.clockNote}>
+            Counting up on this handset from the start time the server recorded.
+          </Text>
+        ) : null}
         {session.zone?.name ? <Text style={styles.zone}>{session.zone.name}</Text> : null}
       </Card>
 
       {error ? <Banner tone="warning" title={error} /> : null}
+
+      {/* --------------------------------------- the code, for the driver to scan */}
+      {/*
+        Only while the parking is running. The same `running` test the card
+        above uses, because a code scanned against a session that has ended
+        attaches the driver to nothing they can act on — and an attendant
+        holding one out at that point is making a promise the server will
+        refuse. Once it has ended this screen is about the money instead.
+      */}
+      {running ? (
+        <Card style={styles.qrCard}>
+          {/*
+            The payload is the session code and nothing else. The citizen app
+            accepts exactly this string typed by hand, so scanning and reading
+            it out are the same path and stay that way.
+          */}
+          <QRCode
+            value={session.code}
+            size={qrSize}
+            color={QR_DARK}
+            backgroundColor={QR_LIGHT}
+            quietZone={theme.space(3)}
+          />
+          {/* Selectable, because this is what a driver types when a camera will not read it. */}
+          <Text style={styles.qrCode} selectable>
+            {session.code}
+          </Text>
+          <Text style={styles.qrNote}>Ask the driver to scan this in the KMCP app.</Text>
+        </Card>
+      ) : null}
 
       {/* ------------------------------------------------- the fare, once known */}
       {quote ? (
@@ -457,8 +544,23 @@ const styles = StyleSheet.create({
   content: { padding: theme.space(2), gap: theme.space(1.5), paddingBottom: theme.space(6) },
   head: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: theme.space(1) },
   code: { ...theme.text.small, color: theme.colour.textMuted, letterSpacing: 1 },
-  stats: { flexDirection: "row", gap: theme.space(4), marginTop: theme.space(0.5) },
+  // Wraps, because a third figure appeared here once bays were allocated and a
+  // long bay code on a narrow handset would otherwise run off the card.
+  stats: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: theme.space(4),
+    marginTop: theme.space(0.5),
+  },
+  clockNote: { ...theme.text.small, color: theme.colour.textMuted },
   zone: { ...theme.text.body, color: theme.colour.textMuted },
+  // White, and otherwise the card every other section uses — the dark border is
+  // what gives a white panel an edge against this background. Its padding is
+  // white space around the code on top of the quiet zone drawn inside the SVG,
+  // which together come to roughly the three clear modules a scanner wants.
+  qrCard: { backgroundColor: QR_LIGHT, alignItems: "center" },
+  qrCode: { ...theme.text.title, color: QR_DARK, letterSpacing: 2 },
+  qrNote: { ...theme.text.small, color: QR_MUTED, textAlign: "center" },
   sectionLabel: { ...theme.text.label, color: theme.colour.textMuted },
   total: {
     flexDirection: "row",
