@@ -33,7 +33,7 @@ export default function Login() {
 
   if (user) return <Redirect href="/(tabs)" />;
 
-  const canSubmit = phone.trim().length >= 10 && password.length >= 6 && !busy;
+  const canSubmit = phone.length === 10 && password.length >= 6 && !busy;
   const canVerify = /^\d{6}$/.test(code) && !busy;
 
   async function submit() {
@@ -94,12 +94,40 @@ export default function Login() {
             <Field
               label="Mobile number"
               value={phone}
-              onChangeText={setPhone}
+              /**
+               * Whatever shape it arrives in, it leaves as ten digits.
+               *
+               * The pad offers a `+`, so people type `+919433361718` — and the
+               * old field simply stopped accepting characters at ten, turning
+               * that into `+91943336` with no indication anything had been
+               * dropped. Now punctuation and country codes are taken off
+               * instead of the end of the number: anything longer than ten
+               * digits keeps its last ten, which is the local number in every
+               * form this gets typed or pasted in.
+               */
+              onChangeText={(next) => {
+                let local = next.replace(/\D/g, "");
+                /**
+                 * Peel off whatever stands in front of the ten-digit number —
+                 * a `91` country code, the `0` people still prefix out of STD
+                 * habit, or both from a `0091…`. Only ever while the string is
+                 * too long to be local, because an Indian mobile can itself
+                 * begin `91` (9123456789) and must not lose its own first two
+                 * digits.
+                 */
+                while (local.length > 10 && (local.startsWith("91") || local.startsWith("0"))) {
+                  local = local.startsWith("91") ? local.slice(2) : local.slice(1);
+                }
+                setPhone(local.slice(0, 10));
+              }}
               keyboardType="phone-pad"
               autoComplete="tel"
               textContentType="telephoneNumber"
               placeholder="98XXXXXXXX"
-              maxLength={10}
+              // Room to type or paste a +91 before it is stripped above; the
+              // value itself never exceeds ten digits.
+              maxLength={16}
+              hint="Ten digits — +91 is added for you."
               editable={!busy}
             />
 
