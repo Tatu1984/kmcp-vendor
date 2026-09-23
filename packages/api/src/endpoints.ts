@@ -11,6 +11,9 @@ import type {
   MediaPurpose,
   Payment,
   PlateLookup,
+  QrClosure,
+  QrPayment,
+  QrReconciliation,
   Session,
   Shift,
   Slot,
@@ -18,7 +21,6 @@ import type {
   SlotSummary,
   SlotType,
   UploadTicket,
-  VerifyPayment,
   Zone,
 } from "./types";
 
@@ -227,28 +229,47 @@ export function createApi(client: ApiClient, queue: OfflineQueue) {
         });
       },
 
-      collectDigital: (sessionId: string, mode: "UPI_QR" | "UPI_INTENT" | "CARD") => {
+      /**
+       * Mints a UPI QR with the fare already inside it.
+       *
+       * The only way this app takes money that is not cash. There is no
+       * checkout sheet on the attendant's handset any more: Razorpay's own
+       * sheet belongs in the citizen app's wallet, and an attendant tapping
+       * through a payment sheet on behalf of a driver was always the wrong
+       * device holding the phone. What comes back is a hosted image the driver
+       * scans with their own UPI app. Not queued — a code minted after the
+       * driver has walked off is worth nothing.
+       */
+      collectUpiQr: (sessionId: string) => {
         const id = newEventId();
-        // Not queued: a gateway order is worthless once the payer has walked
-        // away, so this either happens now or does not happen.
-        return client.post<Payment>("/payments/collect", {
+        return client.post<QrPayment>("/payments/collect", {
           sessionId,
-          mode,
+          mode: "UPI_QR",
           idempotencyKey: id,
         });
       },
 
       /**
-       * Hands the gateway's signed result back so the server can capture it.
+       * Asks the gateway whether a QR has been paid yet.
        *
-       * The signature is computed with a secret this handset has never held,
-       * which is what stops a forged "paid" from capturing anything. The
-       * webhook remains the authority; this exists so the attendant sees a
-       * receipt while the driver is still standing there rather than after
-       * the webhook lands.
+       * The `qr_code.credited` webhook reaches the same capture and remains the
+       * authority, but it cannot reach a development machine — so for the
+       * screen holding a code up to a driver this is not a fallback, it is the
+       * mechanism. Safe to call on a loop: a payment already captured answers
+       * straight away without touching the gateway.
        */
-      verify: (paymentId: string, input: VerifyPayment) =>
-        client.post<Payment>(`/payments/${encodeURIComponent(paymentId)}/verify`, input),
+      reconcileQr: (paymentId: string) =>
+        client.post<QrReconciliation>(`/payments/${encodeURIComponent(paymentId)}/qr/reconcile`),
+
+      /**
+       * Stops an unpaid QR being payable.
+       *
+       * For the attendant who backs out. A code left live can be paid later by
+       * anybody holding a photograph of it, against a fare that has since been
+       * settled in cash.
+       */
+      closeQr: (paymentId: string) =>
+        client.post<QrClosure>(`/payments/${encodeURIComponent(paymentId)}/qr/close`),
     },
 
     slots: {

@@ -182,22 +182,51 @@ export interface Payment {
   paidAt?: string | null;
   receipt?: { id: string; number: string; issuedAt: string } | null;
   replayed?: boolean;
-  /** Present for gateway modes, so a checkout sheet can be opened. */
-  gatewayKeyId?: string;
-  gatewayOrder?: { id: string; amount: number; currency: string };
 }
 
 /**
- * What the checkout sheet hands back, sent verbatim to `POST /payments/:id/verify`.
+ * A hosted UPI QR code, as `POST /payments/collect` returns it for `UPI_QR`.
  *
- * Three opaque strings from Razorpay. The server recomputes the signature
- * with a secret this handset never holds and refuses the capture if it does
- * not match, so nothing here is trusted on its own.
+ * `imageUrl` is a PNG the gateway serves, which is the whole of it — there is
+ * no payload here to draw from, and nothing in either app draws one. `amount`
+ * is the fare the code was minted against and the only figure that belongs
+ * beside it on a screen: a handset that worked the number out again could
+ * print one the driver's UPI app disagrees with.
  */
-export interface VerifyPayment {
-  razorpayOrderId: string;
-  razorpayPaymentId: string;
-  razorpaySignature: string;
+export interface PaymentQr {
+  id: string;
+  imageUrl: string;
+  amount: Paise;
+  /** About ten minutes out. Past it the code is dead, paid or not. */
+  expiresAt: string;
+}
+
+/** A `UPI_QR` collection: the payment, and the code to hold up to the driver. */
+export interface QrPayment extends Payment {
+  qr: PaymentQr;
+}
+
+/**
+ * What `POST /payments/:id/qr/reconcile` answers.
+ *
+ * `settled` is the only thing that means the money landed. `mismatch` says the
+ * gateway reported a figure that is not the fare — which the server refuses to
+ * capture, so it is neither paid nor something to read past.
+ */
+export interface QrReconciliation extends Payment {
+  settled: boolean;
+  mismatch?: true;
+}
+
+/**
+ * What `POST /payments/:id/qr/close` answers.
+ *
+ * `paid: true` means the driver got there first, in the gap between the last
+ * poll and the close. That is a collection, not a cancellation.
+ */
+export interface QrClosure extends Payment {
+  closed: boolean;
+  paid: boolean;
 }
 
 export interface Shift {

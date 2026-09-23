@@ -1,7 +1,6 @@
 import * as React from "react";
-import { Pressable, ScrollView, StyleSheet, Text, View, useWindowDimensions } from "react-native";
-import QRCode from "react-native-qrcode-svg";
-import { useLocalSearchParams, useRouter } from "expo-router";
+import { AppState, Image, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
+import { useFocusEffect, useLocalSearchParams, useRouter } from "expo-router";
 import {
   ApiError,
   formatDuration,
@@ -10,6 +9,7 @@ import {
   formatTime,
   provisionalFare,
   type EndedSession,
+  type Paise,
   type ProvisionalQuote,
   type Payment,
   type Session,
@@ -18,7 +18,6 @@ import {
 import { Banner, Button, Card, Loading, Pill, Plate, Row, Stat } from "../../components/ui";
 import { PlateCamera, type Capture } from "../../components/plate-camera";
 import { api, cache } from "../../lib/api";
-import { useRazorpayCheckout } from "../../lib/checkout";
 import { elapsedMinutesSince, useNow } from "../../lib/elapsed";
 import { useLocation } from "../../lib/location";
 import { useSession } from "../../lib/session";
@@ -34,31 +33,47 @@ import { theme } from "../../lib/theme";
  * counted, and the fare must survive that.
  *
  * Two ways to take the money. Cash is recorded here and captured at once, and
- * queues when there is no signal. UPI goes through the gateway and cannot
- * queue: the server has to mint an order before the driver can scan anything,
- * and an order minted after the driver has gone is worth nothing.
+ * queues when there is no signal. UPI puts a code on this screen with the fare
+ * already inside it, which the driver pays from their own handset — nothing is
+ * paid on the attendant's phone, and none of it can queue: the server has to
+ * mint the code before anyone can scan it, and a code minted after the driver
+ * has gone is worth nothing.
  */
 type CollectMode = "CASH" | "UPI";
 
 /**
- * The three colours the QR card uses instead of the theme's.
+ * Three seconds.
  *
- * Everything else in this app is light type on near-black, and a camera cannot
- * read a QR code rendered that way round — a scanner wants dark modules on a
- * light field. So the code gets its own white card, and the type on it has to
- * be dark to match.
+ * This is the gap between the driver tapping pay and the attendant seeing it,
+ * with both of them standing over the screen waiting — anything slower reads
+ * as the app not having noticed, and the attendant starts asking for cash on
+ * top of a fare that is already settled. It runs only while a code is live and
+ * in front of somebody, a minute or two at a time, so the number of requests
+ * is bounded by the transaction rather than by how long the app is open.
  */
-const QR_LIGHT = "#FFFFFF";
-const QR_DARK = "#0B1220";
-const QR_MUTED = "#475569";
+const QR_POLL_MS = 3_000;
+
+/**
+ * The code currently on screen.
+ *
+ * `outcome` is how it stopped being worth showing: null while it is live and
+ * payable, and otherwise one of the two dead ends. Paid is not an outcome here
+ * — that becomes a `payment` and a receipt, like every other collection.
+ */
+type LiveQr = {
+  paymentId: string;
+  imageUrl: string;
+  /** The server's figure, shown verbatim. It is what the code was minted for. */
+  amount: Paise;
+  expiresAt: string;
+  outcome: null | "expired" | "mismatch";
+};
 
 export default function SessionScreen() {
   const { code } = useLocalSearchParams<{ code: string }>();
   const router = useRouter();
-  const { width } = useWindowDimensions();
   const { refreshShift } = useSession();
   const location = useLocation(false);
-  const checkout = useRazorpayCheckout();
 
   const [session, setSession] = React.useState<Session | EndedSession | null>(null);
   const [payment, setPayment] = React.useState<Payment | null>(null);
@@ -70,6 +85,8 @@ export default function SessionScreen() {
   const [mode, setMode] = React.useState<CollectMode>("CASH");
   /** What to charge when the server could not price it. Never overrides a real quote. */
   const [estimate, setEstimate] = React.useState<ProvisionalQuote | null>(null);
+  /** The code being shown to a driver, if there is one. */
+  const [qr, setQr] = React.useState<LiveQr | null>(null);
 
   React.useEffect(() => {
     if (!code) return;
@@ -114,6 +131,13 @@ export default function SessionScreen() {
    * synced there is nothing a gateway could charge — cash is the only way.
    */
   const upiPossible = quote !== null;
+  /**
+   * The code as far as the gateway is concerned: on screen and still payable.
+   *
+   * Expired and mismatched codes stay in `qr` because the attendant still has
+   * to be told about them, but nothing should be polled or closed against one.
+   */
+  const live = qr && qr.outcome === null ? qr : null;
 
   async function end() {
     if (!session) return;
@@ -169,6 +193,31 @@ export default function SessionScreen() {
     }
   }
 
+  /**
+   * Where every successful collection ends, whoever paid and however.
+   *
+   * Cash arrives here from the queue's answer; a QR arrives from a poll that
+   * found it settled, or from a close that found the driver had got there
+   * first. All of them put the same receipt card on screen, and all of them
+   * have to move the shift totals.
+   */
+  const recordPayment = React.useCallback(
+    async (collected: Payment) => {
+      setQr(null);
+      setPayment(collected);
+      // The session now carries the payment; refresh so what is on screen is
+      // what the server holds.
+      try {
+        setSession(await api.sessions.get(code));
+      } catch {
+        // The payment is recorded either way; a stale session card is not
+        // worth an error over a receipt.
+      }
+      await refreshShift();
+    },
+    [code, refreshShift],
+  );
+
   async function collectCash() {
     if (!session) return;
     setBusy(true);
@@ -177,11 +226,13 @@ export default function SessionScreen() {
     try {
       const result = await api.payments.collectCash(session.id);
       if (result) {
-        setPayment(result);
+        await recordPayment(result);
       } else {
+        // Queued. `recordPayment` refreshes the shift itself, so this branch
+        // is the only one left that has to.
         setError("Saved on this handset. The receipt will be issued when you have signal.");
+        await refreshShift();
       }
-      await refreshShift();
     } catch (cause) {
       setError(cause instanceof ApiError ? cause.message : "Could not record the payment.");
     } finally {
@@ -190,70 +241,180 @@ export default function SessionScreen() {
   }
 
   /**
-   * Order, sheet, verify — three round trips, and only the last one moves
-   * money. A cancelled or dismissed sheet leaves the session exactly as it
-   * was, unpaid and without a banner: the driver changing their mind is not
-   * an error, and the attendant's next move is to offer cash.
+   * Puts a code on screen with the fare already inside it.
+   *
+   * Nothing is paid on this handset. The driver scans with whichever UPI app
+   * they have, pays from their own phone, and this screen finds out by asking
+   * — see the poll below. The attendant's job is to hold the phone up and
+   * watch it turn into a receipt.
    */
   async function collectUpi() {
     if (!session) return;
     setBusy(true);
     setError(null);
 
-    let pending: Payment;
     try {
-      pending = await api.payments.collectDigital(session.id, "UPI_INTENT");
+      const pending = await api.payments.collectUpiQr(session.id);
+      if (!pending.qr?.imageUrl) {
+        setError("The server accepted the request but sent no code back. Take cash instead.");
+        return;
+      }
+      setQr({
+        paymentId: pending.id,
+        imageUrl: pending.qr.imageUrl,
+        amount: pending.qr.amount,
+        expiresAt: pending.qr.expiresAt,
+        outcome: null,
+      });
     } catch (cause) {
       // Includes SERVICE_UNAVAILABLE when the gateway is not configured on
       // this deployment. The server's message already says cash still works.
-      setError(cause instanceof ApiError ? cause.message : "Could not start a UPI payment.");
+      setError(cause instanceof ApiError ? cause.message : "Could not create a UPI code.");
+    } finally {
       setBusy(false);
-      return;
     }
+  }
 
-    if (!pending.gatewayKeyId || !pending.gatewayOrder) {
-      setError("The server accepted the request but sent nothing to pay against. Take cash instead.");
-      setBusy(false);
-      return;
-    }
+  /**
+   * Asks, while the code is up, whether it has been paid.
+   *
+   * There is a `qr_code.credited` webhook and it is the authority, but it
+   * arrives at the server rather than here — and on a development machine
+   * Razorpay cannot reach it arrives nowhere. Asking is what actually settles
+   * this screen, so it is not a fallback.
+   *
+   * It stops the moment the money lands, the code expires or the attendant
+   * leaves, and the interval is cleared on every one of those paths rather
+   * than left firing into a screen that has gone. Paused with the app for the
+   * reason in `lib/elapsed.ts`: a code nobody is holding up is a code nobody
+   * is scanning, and polling for it is mobile data spent on nothing.
+   */
+  useFocusEffect(
+    React.useCallback(() => {
+      if (!live) return;
 
-    const result = await checkout.open({
-      gatewayKeyId: pending.gatewayKeyId,
-      gatewayOrder: pending.gatewayOrder,
-      description: `Parking ${session.code} · ${formatPlate(session.plateNumber)}`,
-    });
+      let timer: ReturnType<typeof setInterval> | null = null;
+      let stopped = false;
 
-    if (result.status === "cancelled") {
-      setBusy(false);
-      return;
-    }
-    if (result.status === "error") {
-      setError(result.message);
-      setBusy(false);
-      return;
-    }
+      const pause = () => {
+        if (timer) clearInterval(timer);
+        timer = null;
+      };
+      const stop = () => {
+        stopped = true;
+        pause();
+      };
 
-    try {
-      const captured = await api.payments.verify(pending.id, {
-        razorpayOrderId: result.razorpayOrderId,
-        razorpayPaymentId: result.razorpayPaymentId,
-        razorpaySignature: result.razorpaySignature,
+      const tick = async () => {
+        if (stopped) return;
+
+        // Past its close time the gateway will not take it, so the answer can
+        // no longer change — and an attendant left holding a dead code up to a
+        // driver gets a failure they cannot explain.
+        if (Date.now() >= Date.parse(live.expiresAt)) {
+          stop();
+          setQr({ ...live, outcome: "expired" });
+          return;
+        }
+
+        try {
+          const result = await api.payments.reconcileQr(live.paymentId);
+          if (stopped) return;
+
+          if (result.mismatch) {
+            stop();
+            setQr({ ...live, outcome: "mismatch" });
+            return;
+          }
+          if (result.settled) {
+            stop();
+            await recordPayment(result);
+          }
+        } catch {
+          // One failed poll is a bad second of signal, not a failed payment.
+          // The next tick asks again, which is sooner than an attendant could
+          // finish reading a banner about it.
+        }
+      };
+
+      const start = () => {
+        if (!stopped) timer ??= setInterval(() => void tick(), QR_POLL_MS);
+      };
+
+      const subscription = AppState.addEventListener("change", (next) => {
+        if (next !== "active") {
+          pause();
+          return;
+        }
+        // Catch up before resuming the interval: the driver may well have paid
+        // while the handset was in a pocket.
+        void tick();
+        start();
       });
-      setPayment(captured);
-      // The session now carries the payment; refresh so what is on screen is
-      // what the server holds, not what was on screen before the sheet opened.
-      try {
-        setSession(await api.sessions.get(session.code));
-      } catch {
-        // The payment is captured either way; a stale session card is not
-        // worth an error over a receipt.
-      }
-      await refreshShift();
+
+      start();
+
+      return () => {
+        subscription.remove();
+        stop();
+      };
+    }, [live, recordPayment]),
+  );
+
+  /**
+   * The code the teardown has to close, in a ref so the cleanup below sees
+   * whichever one is live at unmount rather than the one that was live when
+   * the effect first ran.
+   */
+  const liveQrRef = React.useRef<string | null>(null);
+  React.useEffect(() => {
+    liveQrRef.current = live?.paymentId ?? null;
+  }, [live]);
+
+  /**
+   * Walking away from a live code is how one fare gets paid twice: the
+   * attendant takes cash, leaves, and the photograph somebody took of the
+   * screen is still payable for another ten minutes.
+   *
+   * Fire and forget, because there is no screen left to report to. If the
+   * driver did pay in the meantime the server says so and leaves the capture
+   * alone — closing a paid code is refused there, not here.
+   */
+  React.useEffect(
+    () => () => {
+      const paymentId = liveQrRef.current;
+      liveQrRef.current = null;
+      if (paymentId) void api.payments.closeQr(paymentId).catch(() => {});
+    },
+    [],
+  );
+
+  /**
+   * The attendant backs out — the driver would rather pay cash, or has given
+   * up on the code. The close is the point of this, for the reason above.
+   *
+   * A close that answers `paid` means the driver got there in the gap between
+   * the last poll and this call. That is a collection, and calling it a
+   * cancellation would send an attendant to collect a fare twice.
+   */
+  async function backOutOfUpi() {
+    const closing = live;
+    setQr(null);
+    setMode("CASH");
+    if (!closing) return;
+
+    setBusy(true);
+    try {
+      const result = await api.payments.closeQr(closing.paymentId);
+      if (result.paid) await recordPayment(result);
     } catch (cause) {
+      // Leave the teardown pointed at it, so leaving the screen tries the
+      // close once more rather than abandoning a code that is still payable.
+      liveQrRef.current = closing.paymentId;
       setError(
         cause instanceof ApiError
           ? cause.message
-          : "The payment went through but could not be confirmed here. It will be confirmed by the gateway; do not collect cash.",
+          : "The code could not be closed. Check it has not been paid before taking cash.",
       );
     } finally {
       setBusy(false);
@@ -290,16 +451,6 @@ export default function SessionScreen() {
     ? (elapsedMinutesSince(session.startAt, now) ?? session.elapsedMinutes ?? null)
     : (session.durationMinutes ??
       (session.endAt ? elapsedMinutesSince(session.startAt, Date.parse(session.endAt)) : null));
-
-  /**
-   * As wide as the card will let it be.
-   *
-   * This is held up to a driver's phone, sometimes in full sun, so the modules
-   * want every pixel the handset can give them: the screen's width less the
-   * padding around the scroll and the padding inside the card. Capped so it
-   * stops short of filling a tablet.
-   */
-  const qrSize = Math.min(width - theme.space(8), 288);
 
   const collectLabel =
     owed === null
@@ -340,36 +491,6 @@ export default function SessionScreen() {
       </Card>
 
       {error ? <Banner tone="warning" title={error} /> : null}
-
-      {/* --------------------------------------- the code, for the driver to scan */}
-      {/*
-        Only while the parking is running. The same `running` test the card
-        above uses, because a code scanned against a session that has ended
-        attaches the driver to nothing they can act on — and an attendant
-        holding one out at that point is making a promise the server will
-        refuse. Once it has ended this screen is about the money instead.
-      */}
-      {running ? (
-        <Card style={styles.qrCard}>
-          {/*
-            The payload is the session code and nothing else. The citizen app
-            accepts exactly this string typed by hand, so scanning and reading
-            it out are the same path and stay that way.
-          */}
-          <QRCode
-            value={session.code}
-            size={qrSize}
-            color={QR_DARK}
-            backgroundColor={QR_LIGHT}
-            quietZone={theme.space(3)}
-          />
-          {/* Selectable, because this is what a driver types when a camera will not read it. */}
-          <Text style={styles.qrCode} selectable>
-            {session.code}
-          </Text>
-          <Text style={styles.qrNote}>Ask the driver to scan this in the KMCP app.</Text>
-        </Card>
-      ) : null}
 
       {/* ------------------------------------------------- the fare, once known */}
       {quote ? (
@@ -453,7 +574,63 @@ export default function SessionScreen() {
         </View>
       ) : (
         <View style={styles.actions}>
-          {owed && owed > 0 ? (
+          {qr ? (
+            /* --------------------------------- the code, while there is one */
+            <Card>
+              <Text style={styles.sectionLabel}>UPI</Text>
+              {qr.outcome === null ? (
+                <>
+                  {/*
+                    A light panel under it, deliberately: everything else on
+                    this screen is dark, and a dark code on a dark ground is
+                    one no camera will read.
+                  */}
+                  <View style={styles.qrPanel}>
+                    <Image
+                      source={{ uri: qr.imageUrl }}
+                      style={styles.qrImage}
+                      resizeMode="contain"
+                      accessibilityRole="image"
+                      accessibilityLabel={`UPI code for ${formatMoney(qr.amount)}`}
+                    />
+                  </View>
+                  {/* The server's figure, not one worked out again here. */}
+                  <Text style={styles.qrAmount}>{formatMoney(qr.amount)}</Text>
+                  <Text style={styles.qrNote}>
+                    Have the driver scan this with any UPI app. The amount is already in the code,
+                    so they cannot pay the wrong one. This screen shows the receipt by itself once
+                    the money lands — do not take cash as well.
+                  </Text>
+                </>
+              ) : qr.outcome === "expired" ? (
+                <>
+                  <Banner
+                    tone="warning"
+                    title="This code has expired"
+                    body="Nothing was paid against it and nothing can be now. Show a fresh one, or take cash."
+                  />
+                  <Button
+                    label={`Show a new code for ${formatMoney(qr.amount)}`}
+                    onPress={() => void collectUpi()}
+                    busy={busy}
+                  />
+                </>
+              ) : (
+                <Banner
+                  tone="danger"
+                  title="The amount paid does not match the fare"
+                  body={`The gateway reported something other than the ${formatMoney(qr.amount)} owed, so nothing was captured and there is no receipt. This is not paid — it has to be sorted out with your supervisor before the vehicle is released.`}
+                />
+              )}
+              <Button
+                label="Take cash instead"
+                variant="secondary"
+                size="medium"
+                onPress={() => void backOutOfUpi()}
+                disabled={busy}
+              />
+            </Card>
+          ) : owed && owed > 0 ? (
             <>
               {/* ------------------------------------------- how to take it */}
               <View style={styles.modes} accessibilityRole="radiogroup">
@@ -503,8 +680,6 @@ export default function SessionScreen() {
           setCameraOpen(false);
         }}
       />
-
-      {checkout.modal}
     </ScrollView>
   );
 }
@@ -554,14 +729,26 @@ const styles = StyleSheet.create({
   },
   clockNote: { ...theme.text.small, color: theme.colour.textMuted },
   zone: { ...theme.text.body, color: theme.colour.textMuted },
+  sectionLabel: { ...theme.text.label, color: theme.colour.textMuted },
   // White, and otherwise the card every other section uses — the dark border is
   // what gives a white panel an edge against this background. Its padding is
-  // white space around the code on top of the quiet zone drawn inside the SVG,
-  // which together come to roughly the three clear modules a scanner wants.
-  qrCard: { backgroundColor: QR_LIGHT, alignItems: "center" },
-  qrCode: { ...theme.text.title, color: QR_DARK, letterSpacing: 2 },
-  qrNote: { ...theme.text.small, color: QR_MUTED, textAlign: "center" },
-  sectionLabel: { ...theme.text.label, color: theme.colour.textMuted },
+  // white space around the code on top of the quiet zone the gateway draws into
+  // the image, which together come to roughly the three clear modules a scanner
+  // wants.
+  qrPanel: {
+    backgroundColor: "#FFFFFF",
+    borderRadius: theme.radius.md,
+    borderWidth: 1,
+    borderColor: theme.colour.border,
+    padding: theme.space(2),
+    alignItems: "center",
+  },
+  // Square, and as wide as the card allows. This is held out at arm's length
+  // to somebody else's camera in Kolkata sun; a code sized to sit politely in
+  // the layout is a code that has to be scanned twice.
+  qrImage: { width: "100%", aspectRatio: 1, maxWidth: 320 },
+  qrAmount: { ...theme.text.display, color: theme.colour.text, textAlign: "center" },
+  qrNote: { ...theme.text.small, color: theme.colour.textMuted },
   total: {
     flexDirection: "row",
     justifyContent: "space-between",
