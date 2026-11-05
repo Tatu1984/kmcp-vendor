@@ -80,11 +80,9 @@ export default function Login() {
     >
       <Screen>
         <View style={styles.header}>
-          <Text style={styles.brand}>KMCP</Text>
+          <Text style={styles.brand}>SP Vendor</Text>
           <Text style={styles.title}>Attendant sign-in</Text>
-          <Text style={styles.subtitle}>
-            Kolkata Municipal Corporation Parking
-          </Text>
+          <Text style={styles.subtitle}>Smart Parking</Text>
         </View>
 
         {error ? <Banner tone="danger" title={error} /> : null}

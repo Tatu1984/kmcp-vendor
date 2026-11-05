@@ -1,7 +1,8 @@
 {
   "expo": {
-    "name": "KMCP Vendor",
+    "name": "SP Vendor",
     "slug": "kmcp-vendor",
+    "owner": "infps",
     "version": "1.0.0",
     "orientation": "portrait",
     "scheme": "kmcpvendor",
@@ -11,15 +12,19 @@
     ],
     "ios": {
       "supportsTablet": false,
-      "bundleIdentifier": "in.gov.kmc.parking.vendor"
+      "bundleIdentifier": "com.smartparking.vendor"
     },
     "android": {
-      "package": "in.gov.kmc.parking.vendor",
+      "package": "com.smartparking.vendor",
       "permissions": [
         "CAMERA",
         "ACCESS_FINE_LOCATION",
         "ACCESS_COARSE_LOCATION"
-      ]
+      ],
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#07382d"
+      }
     },
     "plugins": [
       "expo-router",
@@ -27,18 +32,28 @@
       [
         "expo-camera",
         {
-          "cameraPermission": "KMCP needs the camera to photograph the number plate. That photograph is the evidence behind the fare."
+          "cameraPermission": "SP Vendor needs the camera to photograph the number plate. That photograph is the evidence behind the fare."
         }
       ],
       [
         "expo-location",
         {
-          "locationAlwaysAndWhenInUsePermission": "KMCP checks you are standing in the zone before a session can be started there."
+          "locationAlwaysAndWhenInUsePermission": "SP Vendor checks you are standing in the zone before a session can be started there."
+        }
+      ],
+      [
+        "expo-splash-screen",
+        {
+          "image": "./assets/splash-icon.png",
+          "imageWidth": 200,
+          "resizeMode": "contain",
+          "backgroundColor": "#07382d"
         }
       ]
     ],
     "experiments": {
       "typedRoutes": true
-    }
+    },
+    "icon": "./assets/icon.png"
   }
 }
